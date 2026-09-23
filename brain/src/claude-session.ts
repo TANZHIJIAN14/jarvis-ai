@@ -55,6 +55,11 @@ export class ClaudeSession {
     });
   }
 
+  // Starts the CLI ahead of the first question: a warm process answers ~1.2 s sooner.
+  warm(): void {
+    if (!this.proc && !this.closing) this.spawn();
+  }
+
   // Ends the current turn. SIGINT, not SIGTERM: SIGTERM leaves the turn unfinished.
   // The CLI answers with a `result` and then exits by itself about a second later.
   interrupt(): void {
