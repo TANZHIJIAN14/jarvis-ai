@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const env = process.env;
 
@@ -25,8 +26,17 @@ export const config = {
   // Claude model alias; unset = the CLI's default.
   model: env.JARVIS_MODEL,
   permissionMode: env.JARVIS_PERMISSION_MODE ?? "acceptEdits",
-  // Voice name or identifier; unset = best-quality installed voice for your language.
+  // "kokoro" (local neural voice) or "apple" (system voice).
+  tts: env.JARVIS_TTS ?? "kokoro",
+  // Kokoro voice (e.g. bm_george, bm_daniel, bm_lewis, bm_fable, am_michael) or,
+  // with JARVIS_TTS=apple, a system voice name; unset = the default for that engine.
   voice: env.JARVIS_VOICE,
-  // Speaking speed; 1.0 = the system's normal rate.
-  voiceSpeed: Number(env.JARVIS_VOICE_SPEED ?? 1.2),
+  // Speaking speed; 1.0 = normal.
+  voiceSpeed: Number(env.JARVIS_VOICE_SPEED ?? 1.0),
+  // Wake word and VAD models (scripts/fetch-models.sh).
+  modelsDir: env.JARVIS_MODELS_DIR ?? fileURLToPath(new URL("../../models", import.meta.url)),
+  // Score in 0..1 that counts as "Hey Jarvis". Raise it if Jarvis wakes by mistake.
+  wakeThreshold: Number(env.JARVIS_WAKE_THRESHOLD ?? 0.5),
+  // Local port the Jarvis UI connects to.
+  uiPort: Number(env.JARVIS_UI_PORT ?? 8765),
 };

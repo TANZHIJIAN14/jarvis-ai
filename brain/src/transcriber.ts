@@ -48,6 +48,11 @@ export class Transcriber {
     return this.send(await openAsBlob(wavFile));
   }
 
+  // 16 kHz mono 16-bit PCM, straight from the listener.
+  transcribePcm(pcm: Buffer): Promise<string> {
+    return this.send(new Blob([new Uint8Array(toWav(pcm))]));
+  }
+
   // The first request after loading is several seconds slower (GPU kernels get compiled),
   // so spend it on half a second of silence at startup instead of on the user's first words.
   private async warmUp(): Promise<void> {
