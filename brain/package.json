@@ -1,0 +1,19 @@
+{
+  "name": "jarvis-brain",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=23"
+  },
+  "scripts": {
+    "prespike": "test -x ../native/bin/mic-capture -a -x ../native/bin/speak || npm run build:native",
+    "spike": "node --experimental-strip-types --no-warnings=ExperimentalWarning src/spike.ts",
+    "build:native": "mkdir -p ../native/bin && cd ../native && xcrun swiftc -O -swift-version 5 mic-capture.swift -o bin/mic-capture && xcrun swiftc -O -swift-version 5 speak.swift -o bin/speak",
+    "test": "node --experimental-strip-types --no-warnings=ExperimentalWarning --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
