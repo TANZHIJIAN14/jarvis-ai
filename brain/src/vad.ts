@@ -5,6 +5,17 @@ import ort from "onnxruntime-node";
 // 64 samples as context and carries the model's recurrent state forward.
 
 export const VAD_FRAME = 512; // 32 ms at 16 kHz
+
+// The listener's models are tiny and run every few milliseconds. ONNX Runtime's default gives
+// each session a thread pool the size of the machine, whose threads spin while waiting; five
+// such pools plus Kokoro's oversubscribed the CPU and the listener fell ~30 s behind the mic.
+// One thread, no spinning, is faster for models this small.
+export const SMALL_MODEL_OPTIONS: ort.InferenceSession.SessionOptions = {
+  intraOpNumThreads: 1,
+  interOpNumThreads: 1,
+  executionMode: "sequential",
+  extra: { session: { intra_op: { allow_spinning: "0" }, inter_op: { allow_spinning: "0" } } },
+};
 const CONTEXT = 64;
 
 export class Vad {
@@ -18,7 +29,7 @@ export class Vad {
   }
 
   static async load(modelPath: string): Promise<Vad> {
-    return new Vad(await ort.InferenceSession.create(modelPath));
+    return new Vad(await ort.InferenceSession.create(modelPath, SMALL_MODEL_OPTIONS));
   }
 
   async process(frame: Int16Array): Promise<number> {

@@ -2,7 +2,8 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -10,8 +11,9 @@ import { ClaudeSession } from "./claude-session.ts";
 import { config } from "./config.ts";
 import { Jarvis, type UiEvent } from "./jarvis.ts";
 import { KokoroVoice } from "./kokoro.ts";
-import { Listener } from "./listener.ts";
+import { DEFAULT_LISTENER_OPTIONS, Listener } from "./listener.ts";
 import { MicStream } from "./mic-stream.ts";
+import { toWav } from "./recorder.ts";
 import { Speaker } from "./speaker.ts";
 import { Transcriber } from "./transcriber.ts";
 import { UiServer } from "./ui-server.ts";
@@ -61,6 +63,19 @@ const listener = new Listener(wakeWord, vad, {
   },
   onUtterance: (pcm) => void jarvis.onUtterance(pcm),
   onNoSpeech: () => jarvis.onNoSpeech(),
+  onBargeIn: () => {
+    log(dim("  (you talked over Jarvis)"));
+    saveWatchDebug();
+    jarvis.onBargeIn();
+  },
+  onWatchEnd: (peakMs) => {
+    if (config.echoCancel) log(dim(`  (talk-over check: most speech heard while Jarvis spoke was ${Math.round(peakMs)} ms; ${DEFAULT_LISTENER_OPTIONS.bargeInMs} ms interrupts)`));
+    saveWatchDebug();
+  },
+  onWatchFrame: config.debugAudio ? (prob, frame) => {
+    watchProbs.push(Number(prob.toFixed(3)));
+    watchFrames.push(Int16Array.from(frame));
+  } : undefined,
   onLevel: (value) => {
     // The orb only needs the level while listening, ~12 times a second.
     if (jarvis.state !== "listening" || Date.now() - lastLevelAt < 80) return;
@@ -84,6 +99,7 @@ const jarvis = new Jarvis({
     logEvent(event);
     ui.broadcast(event);
   },
+  bargeIn: config.echoCancel, // switched off below if the mic falls back to plain capture
 });
 
 const token = randomBytes(16).toString("hex");
@@ -100,11 +116,34 @@ const ui = new UiServer({
 await ui.start();
 jarvis.prepare();
 
-const mic = new MicStream((samples) => void listener.feed(samples));
+let fedSamples = 0;
+let doneSamples = 0;
+const mic = new MicStream((samples) => {
+  fedSamples += samples.length;
+  void listener.feed(samples).then(() => (doneSamples += samples.length));
+}, { echoCancel: config.echoCancel });
+mic.onRestart = (reason) => log(dim(`  (${reason})`));
+
+// JARVIS_DEBUG_AUDIO=1: every 2 s while Jarvis speaks, how much mic audio arrived and how far
+// behind the listener is. Tells a stalled mic apart from a lagging brain.
+if (config.debugAudio) {
+  let lastFed = 0;
+  setInterval(() => {
+    const arrived = (fedSamples - lastFed) / 16_000;
+    lastFed = fedSamples;
+    if (jarvis.state !== "speaking") return;
+    const behind = (fedSamples - doneSamples) / 16_000;
+    log(dim(`  (audio health: ${arrived.toFixed(1)} s of mic audio in the last 2 s; listener ${behind.toFixed(1)} s behind; ${watchFrames.length} talk-over frames)`));
+  }, 2000);
+}
 await mic.start();
+jarvis.bargeIn = mic.echoCancelling; // without echo cancellation Jarvis would interrupt itself
 const uiApp = launchUi();
 
-log(dim(`Ready. Say "Hey Jarvis", click the orb, or press Enter here. Ctrl+C quits.\n`));
+log(dim(`Ready. Say "Hey Jarvis", click the orb, or press Enter here. Ctrl+C quits.`));
+log(dim(mic.echoCancelling
+  ? "Echo cancellation on: talk over Jarvis to interrupt it.\n"
+  : "Echo cancellation off: interrupt with \"Hey Jarvis\", a click or Enter.\n"));
 const keys = createInterface({ input: process.stdin });
 keys.on("line", () => (jarvis.state === "idle" ? jarvis.activate(false) : jarvis.stop()));
 keys.on("SIGINT", shutdown);
@@ -123,6 +162,23 @@ async function loadKokoro(): Promise<KokoroVoice | undefined> {
     log(dim(`Kokoro voice unavailable (${(err as Error).message}); using the system voice.`));
     return undefined;
   }
+}
+
+// JARVIS_DEBUG_AUDIO=1: what the mic heard during each reply, with the VAD score per 32 ms frame.
+let watchProbs: number[] = [];
+let watchFrames: Int16Array[] = [];
+function saveWatchDebug(): void {
+  if (!config.debugAudio || watchFrames.length === 0) return;
+  const dir = join(tmpdir(), "jarvis-debug");
+  mkdirSync(dir, { recursive: true });
+  const name = join(dir, `talk-over-${Date.now()}`);
+  const pcm = Buffer.alloc(watchFrames.length * 512 * 2);
+  watchFrames.forEach((f, i) => f.forEach((s, j) => pcm.writeInt16LE(s, (i * 512 + j) * 2)));
+  writeFileSync(`${name}.wav`, toWav(pcm));
+  writeFileSync(`${name}.json`, JSON.stringify({ frameMs: 32, probs: watchProbs }));
+  log(dim(`  (saved ${name}.wav)`));
+  watchProbs = [];
+  watchFrames = [];
 }
 
 function launchUi(): ChildProcess | undefined {
@@ -165,9 +221,11 @@ function logEvent(event: UiEvent): void {
 
 function shutdown(): void {
   log(dim("\nBye."));
+  saveWatchDebug();
   mic.stop();
   jarvis.close();
   speaker.close();
+  kokoro?.close();
   transcriber.stop();
   uiApp?.kill();
   ui.close();

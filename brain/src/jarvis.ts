@@ -28,6 +28,27 @@ export type UiCommand = { type: "activate" } | { type: "stop" } | { type: "quit"
 const WAKE_CAPTURE: CaptureOptions = { preRollMs: 1500, noSpeechTimeoutMs: 5000 };
 const CLICK_CAPTURE: CaptureOptions = { preRollMs: 200, noSpeechTimeoutMs: 6000 };
 const FOLLOW_UP_CAPTURE: CaptureOptions = { preRollMs: 300, noSpeechTimeoutMs: 8000 };
+// Talking over Jarvis: the words that triggered it are already in the pre-roll.
+const BARGE_IN_CAPTURE: CaptureOptions = { preRollMs: 800, noSpeechTimeoutMs: 3000, speechStarted: true };
+// An utterance made only of these (with at least one STOP_WORD) means "stop talking",
+// not a question for Claude: "Stop, man. Stop.", "okay, that's enough", "hey Jarvis, wait".
+const STOP_WORDS = new Set(["stop", "wait", "holdon", "nevermind", "cancel", "quiet", "shush", "hush", "shutup",
+  "enough", "pause", "okay", "ok", "thanks", "thank"]);
+const FILLER_WORDS = new Set(["man", "please", "hey", "jarvis", "just", "now", "that's", "thats", "it", "oh", "uh",
+  "um", "right", "alright", "you", "dude", "sir", "a", "second", "moment", "minute", "talking", "there"]);
+
+export function isStopRequest(text: string): boolean {
+  const words = text
+    .toLowerCase()
+    .replace(/\bnever mind\b/g, "nevermind")
+    .replace(/\bhold on\b/g, "holdon")
+    .replace(/\bshut up\b/g, "shutup")
+    .replace(/[^a-z' ]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+  return words.length > 0 && words.length <= 10 && words.some((w) => STOP_WORDS.has(w))
+    && words.every((w) => STOP_WORDS.has(w) || FILLER_WORDS.has(w));
+}
 const SESSION_IDLE_MS = 10 * 60_000; // design doc: a wake-up within 10 min continues the session
 const CHIME = "/System/Library/Sounds/Pop.aiff";
 
@@ -38,6 +59,8 @@ export type JarvisDeps = {
   newSession: () => ClaudeSession;
   emit: (event: UiEvent) => void;
   chime?: () => void;
+  // Interrupt by talking over Jarvis. Needs echo cancellation, or Jarvis hears itself.
+  bargeIn?: boolean;
 };
 
 export class Jarvis {
@@ -45,12 +68,14 @@ export class Jarvis {
   followUp = false;
   private deps: JarvisDeps;
   private gen = 0;
+  bargeIn: boolean;
   private session: ClaudeSession | undefined;
   private lastTurnAt = 0;
   private turn: Promise<unknown> = Promise.resolve();
 
   constructor(deps: JarvisDeps) {
     this.deps = deps;
+    this.bargeIn = deps.bargeIn ?? false;
   }
 
   // "Hey Jarvis" or a click on the orb: drop whatever is happening and listen.
@@ -59,6 +84,14 @@ export class Jarvis {
     this.gen++;
     (this.deps.chime ?? chime)();
     this.listen(byVoice ? WAKE_CAPTURE : CLICK_CAPTURE, false);
+  }
+
+  // The user started talking while Jarvis was speaking.
+  onBargeIn(): void {
+    if (!this.bargeIn || this.state !== "speaking") return;
+    this.interruptReply();
+    this.gen++;
+    this.listen(BARGE_IN_CAPTURE, false);
   }
 
   stop(): void {
@@ -95,6 +128,10 @@ export class Jarvis {
     }
     this.deps.emit({ type: "transcript", text });
 
+    if (isStopRequest(text)) {
+      this.setState("idle");
+      return;
+    }
     if (/^(new session|fresh start|start over)\b/i.test(text)) {
       this.resetSession();
       this.prepare();
@@ -193,6 +230,7 @@ export class Jarvis {
     if (state !== "listening") this.followUp = false;
     if (state === this.state && state !== "listening") return;
     this.state = state;
+    this.deps.listener.watchForSpeech(this.bargeIn && state === "speaking");
     this.deps.emit({ type: "state", state, followUp: this.followUp });
   }
 }

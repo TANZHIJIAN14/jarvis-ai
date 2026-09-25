@@ -37,6 +37,11 @@ export const config = {
   modelsDir: env.JARVIS_MODELS_DIR ?? fileURLToPath(new URL("../../models", import.meta.url)),
   // Score in 0..1 that counts as "Hey Jarvis". Raise it if Jarvis wakes by mistake.
   wakeThreshold: Number(env.JARVIS_WAKE_THRESHOLD ?? 0.5),
+  // Apple's echo cancellation on the mic, so you can interrupt Jarvis by talking over it.
+  // It also removes music and videos playing on this Mac from what Jarvis hears.
+  echoCancel: (env.JARVIS_ECHO_CANCEL ?? "1") !== "0",
+  // Saves what the mic hears while Jarvis speaks (plus VAD scores) for tuning talk-over.
+  debugAudio: env.JARVIS_DEBUG_AUDIO === "1",
   // Local port the Jarvis UI connects to.
   uiPort: Number(env.JARVIS_UI_PORT ?? 8765),
 };

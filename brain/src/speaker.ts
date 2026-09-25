@@ -101,6 +101,9 @@ export class Speaker {
     if (!existsSync(SPEAK)) throw new Error("speak is not built; run npm run build:native");
     const proc = spawn(SPEAK, this.args, { stdio: ["pipe", "pipe", "ignore"] });
     this.proc = proc;
+    // If the helper dies (Ctrl+C reaches it first), writes fail with EPIPE; the exit handler
+    // below resets state and the next sentence starts a fresh helper.
+    proc.stdin!.on("error", () => {});
     createInterface({ input: proc.stdout! }).on("line", (event) => {
       if (event === "start") {
         this.onFirstAudio?.();

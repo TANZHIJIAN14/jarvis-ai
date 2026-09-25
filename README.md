@@ -20,7 +20,7 @@ The first start builds the Swift helpers and downloads the wake word and voice a
 
 - Say **"Hey Jarvis"** and your request in one breath, or pause after "Hey Jarvis" and then speak. Jarvis stops listening after 0.7 s of silence.
 - After it answers, you have 8 seconds to reply without the wake word (the ring around the orb).
-- Say "Hey Jarvis" again, click the orb, or press Enter in the terminal to interrupt.
+- Talk over Jarvis to interrupt it (about a third of a second of speech); "stop" or "never mind" just ends it. "Hey Jarvis", a click on the orb or Enter in the terminal also interrupt.
 - Say "new session" to start a fresh Claude conversation. A wake-up after 10 idle minutes also starts fresh.
 
 ## Layout
@@ -39,11 +39,11 @@ The first start builds the Swift helpers and downloads the wake word and voice a
 | `brain/src/speaker.ts` | Synthesizes the next sentence while the current one plays; barge-in |
 | `brain/src/ui-server.ts` | Token-protected loopback WebSocket for the UI |
 | `native/JarvisUI.swift` | Menu bar icon and floating orb + response panel (SwiftUI) |
-| `native/mic-capture.swift` | Streams the default mic as 16 kHz PCM (AVAudioEngine) |
+| `native/mic-capture.swift` | Streams the default mic as 16 kHz PCM (AVAudioEngine), with Apple's echo cancellation |
 | `native/speak.swift` | Long-lived audio output helper: plays Kokoro audio or speaks with the system voice |
 | `brain/voice-rules.md` | System prompt addition that makes replies suitable for speech |
 
-Settings are environment variables: `JARVIS_WORKSPACE` (default `~/jarvis-workspace`), `JARVIS_MODEL` (e.g. `sonnet`), `JARVIS_WAKE_THRESHOLD` (default 0.5; raise it if Jarvis wakes by mistake), `JARVIS_TTS` (`kokoro` default, or `apple` for the system voice), `JARVIS_VOICE` (Kokoro voice, default `bm_george`; also `bm_daniel`, `bm_lewis`, `bm_fable`, `am_michael`, ...; with `JARVIS_TTS=apple`, a system voice name), `JARVIS_VOICE_SPEED` (default 1.0 = normal; e.g. 0.9 slower, 1.1 faster), `JARVIS_PERMISSION_MODE` (default `acceptEdits`), `JARVIS_VOCABULARY` (names and terms Whisper should expect), `JARVIS_UI_PORT` (default 8765), `JARVIS_WHISPER_MODEL`.
+Settings are environment variables: `JARVIS_WORKSPACE` (default `~/jarvis-workspace`), `JARVIS_MODEL` (e.g. `sonnet`), `JARVIS_WAKE_THRESHOLD` (default 0.5; raise it if Jarvis wakes by mistake), `JARVIS_TTS` (`kokoro` default, or `apple` for the system voice), `JARVIS_VOICE` (Kokoro voice, default `bm_george`; also `bm_daniel`, `bm_lewis`, `bm_fable`, `am_michael`, ...; with `JARVIS_TTS=apple`, a system voice name), `JARVIS_VOICE_SPEED` (default 1.0 = normal; e.g. 0.9 slower, 1.1 faster), `JARVIS_PERMISSION_MODE` (default `acceptEdits`), `JARVIS_VOCABULARY` (names and terms Whisper should expect), `JARVIS_ECHO_CANCEL` (default 1; 0 turns off Apple's echo cancellation, and with it talking over Jarvis), `JARVIS_UI_PORT` (default 8765), `JARVIS_WHISPER_MODEL`.
 
 ## Test
 
