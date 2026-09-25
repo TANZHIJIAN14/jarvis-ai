@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { mkdirSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ClaudeSession, TurnHandlers, TurnResult } from "../src/claude-session.ts";
+import { HistoryStore } from "../src/history.ts";
+import { SessionManager } from "../src/sessions.ts";
 import { isStopRequest, Jarvis, stripWakePhrase, type UiEvent } from "../src/jarvis.ts";
 import type { CaptureOptions, Listener } from "../src/listener.ts";
 import type { Speaker } from "../src/speaker.ts";
@@ -39,7 +44,7 @@ function fakeSession() {
   return { session: session as unknown as ClaudeSession, turns, interrupts: () => interrupted };
 }
 
-function setup(transcripts: string[], opts: { bargeIn?: boolean } = {}) {
+function setup(transcripts: string[], opts: { bargeIn?: boolean; history?: HistoryStore } = {}) {
   const events: UiEvent[] = [];
   const captures: CaptureOptions[] = [];
   const watching: boolean[] = [];
@@ -55,6 +60,19 @@ function setup(transcripts: string[], opts: { bargeIn?: boolean } = {}) {
     stop() {},
     idle: async () => {},
   };
+  const history = opts.history ?? new HistoryStore(":memory:");
+  const projectsDir = mkdtempSync(join(tmpdir(), "jarvis-projects-"));
+  mkdirSync(join(projectsDir, "payments-platform"));
+  const claudeStarts: Array<{ cwd: string; resume?: string }> = [];
+  const sessions = new SessionManager({
+    history,
+    newClaude: (o) => {
+      claudeStarts.push(o);
+      return claude.session;
+    },
+    defaultCwd: "/tmp/jarvis-workspace",
+    projectsDir,
+  });
   const jarvis = new Jarvis({
     listener: {
       startCapture: (o: CaptureOptions) => captures.push(o),
@@ -63,13 +81,14 @@ function setup(transcripts: string[], opts: { bargeIn?: boolean } = {}) {
     } as unknown as Listener,
     transcriber: { transcribePcm: async () => transcripts.shift() ?? "" } as unknown as Transcriber,
     speaker: speaker as unknown as Speaker,
-    newSession: () => claude.session,
+    sessions,
+    history,
     emit: (e) => events.push(e),
     chime: () => {},
     bargeIn: opts.bargeIn,
   });
   const states = () => events.filter((e) => e.type === "state").map((e) => (e as { state: string }).state);
-  return { jarvis, events, captures, spoken, claude, states, watching };
+  return { jarvis, events, captures, spoken, claude, states, watching, history, claudeStarts, projectsDir };
 }
 
 test("a full turn: wake, transcribe, reply by voice, then a follow-up window", async () => {
@@ -182,4 +201,63 @@ test("recognises 'stop' requests, including repeats and filler, but not real que
   for (const t of ["Stop the dev server", "Wait, use the other branch", "Okay, can you start over again?", "No.", ""]) {
     assert.ok(!isStopRequest(t), t);
   }
+});
+
+async function turn(ctx: ReturnType<typeof setup>, reply: string) {
+  ctx.jarvis.activate(true);
+  const done = ctx.jarvis.onUtterance(new Int16Array(16));
+  await tick();
+  const t = ctx.claude.turns.at(-1);
+  if (t && !("done" in t)) {
+    t.handlers.onText!(reply);
+    t.finish({ text: reply, sessionId: `claude-${ctx.claude.turns.length}` });
+  }
+  await done;
+}
+
+test("records each turn in the history", async () => {
+  const ctx = setup(["Hey Jarvis, plan the Kokoro voice work"]);
+  await turn(ctx, "Let's start with the voice samples.");
+  const [session] = ctx.history.recent();
+  assert.equal(session.turns, 1);
+  assert.equal(session.claudeSessionId, "claude-1");
+  assert.deepEqual(ctx.history.transcript(session.id).map((t) => [t.user, t.reply]), [
+    ["plan the Kokoro voice work", "Let's start with the voice samples."],
+  ]);
+});
+
+test("'go back to …' resumes a past session by what it was about", async () => {
+  const ctx = setup(["Jarvis, plan the Kokoro voice work", "new session", "Jarvis, go back to the Kokoro voice"]);
+  await turn(ctx, "Let's start with the voice samples.");
+  await turn(ctx, "");
+  assert.deepEqual(ctx.spoken.slice(-1), ["Okay, starting fresh."]);
+  await turn(ctx, "");
+  assert.match(ctx.spoken.at(-1)!, /^Back to our conversation from earlier today\.$/);
+  assert.deepEqual(ctx.claudeStarts.at(-1), { cwd: "/tmp/jarvis-workspace", resume: "claude-1" });
+  assert.equal(ctx.claude.turns.length, 1, "commands never reach Claude");
+});
+
+test("'go back to …' with no matching session is just a request", async () => {
+  const ctx = setup(["Jarvis, continue the story"]);
+  await turn(ctx, "And then the lighthouse keeper...");
+  assert.equal(ctx.claude.turns[0].text, "continue the story");
+});
+
+test("'switch to the … project' starts a session in that folder", async () => {
+  const ctx = setup(["Hey Jarvis, switch to the payments platform project"]);
+  await turn(ctx, "");
+  assert.equal(ctx.spoken.at(-1), "Okay, working in payments platform now.");
+  assert.equal(ctx.claudeStarts.at(-1)!.cwd, join(ctx.projectsDir, "payments-platform"));
+});
+
+test("'what did we decide about …' hands Claude the relevant past turns", async () => {
+  const ctx = setup(["Jarvis, which voice should we use?", "new session", "What did we decide about the voice?"]);
+  await turn(ctx, "Let's go with George, the British Kokoro voice.");
+  await turn(ctx, "");
+  await turn(ctx, "We picked George.");
+  const prompt = ctx.claude.turns.at(-1)!.text;
+  assert.match(prompt, /^What did we decide about the voice\?/);
+  assert.match(prompt, /George, the British Kokoro voice/);
+  assert.equal(ctx.history.transcript(ctx.history.recent()[0].id)[0].user, "What did we decide about the voice?",
+    "history keeps what the user said, not the notes");
 });

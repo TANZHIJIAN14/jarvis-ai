@@ -25,6 +25,7 @@ final class JarvisModel: ObservableObject {
   @Published var tools: [String] = []
   @Published var notice = ""
   @Published var connected = false
+  @Published var sessionLabel = "" // "project · title" of the current conversation
 
   var hasCard: Bool { !transcript.isEmpty || !reply.isEmpty || !notice.isEmpty }
 
@@ -56,6 +57,10 @@ final class JarvisModel: ObservableObject {
       if let error = event["error"] as? String { notice = error }
     case "notice":
       notice = event["text"] as? String ?? ""
+    case "session":
+      let project = (event["project"] as? String ?? "").replacingOccurrences(of: "-", with: " ")
+      let title = event["title"] as? String
+      sessionLabel = title.map { "\(project) · \($0)" } ?? project
     default:
       break
     }
@@ -241,6 +246,15 @@ struct JarvisView: View {
         .contentShape(Circle())
         .onTapGesture(perform: onOrbTap)
         .help(model.state == "idle" ? "Talk to Jarvis" : "Stop")
+      if !model.sessionLabel.isEmpty {
+        Text(model.sessionLabel)
+          .font(.system(size: 11, weight: .medium))
+          .foregroundStyle(.secondary)
+          .lineLimit(1)
+          .padding(.horizontal, 10)
+          .padding(.vertical, 3)
+          .background(.ultraThinMaterial, in: Capsule())
+      }
       if model.hasCard {
         Card(model: model)
           .transition(.opacity.combined(with: .move(edge: .top)))

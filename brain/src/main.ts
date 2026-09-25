@@ -8,12 +8,15 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { ClaudeSession } from "./claude-session.ts";
+import { HistoryStore, type SessionRecord } from "./history.ts";
 import { config } from "./config.ts";
 import { Jarvis, type UiEvent } from "./jarvis.ts";
 import { KokoroVoice } from "./kokoro.ts";
 import { DEFAULT_LISTENER_OPTIONS, Listener } from "./listener.ts";
 import { MicStream } from "./mic-stream.ts";
+import { claudeOneShot } from "./oneshot.ts";
 import { toWav } from "./recorder.ts";
+import { SessionManager } from "./sessions.ts";
 import { Speaker } from "./speaker.ts";
 import { Transcriber } from "./transcriber.ts";
 import { UiServer } from "./ui-server.ts";
@@ -84,17 +87,33 @@ const listener = new Listener(wakeWord, vad, {
   },
 }, { wakeThreshold: config.wakeThreshold });
 
-const jarvis = new Jarvis({
-  listener,
-  transcriber,
-  speaker,
-  newSession: () =>
+const history = new HistoryStore(join(config.dataDir, "jarvis.sqlite"));
+const sessionEvent = (s: SessionRecord): UiEvent => ({ type: "session", id: s.id, title: s.title, project: s.project });
+const sessions = new SessionManager({
+  history,
+  newClaude: ({ cwd, resume }) =>
     new ClaudeSession({
-      cwd: config.workspace,
+      cwd,
+      resume,
       model: config.model,
       permissionMode: config.permissionMode,
       appendSystemPromptFile: voiceRules,
     }),
+  ask: claudeOneShot("haiku"),
+  defaultCwd: config.workspace,
+  projectsDir: config.projectsDir,
+  onChange: (s) => {
+    log(dim(`  [session: ${s.title ?? "untitled"} · ${s.project}]`));
+    ui.broadcast(sessionEvent(s));
+  },
+});
+
+const jarvis = new Jarvis({
+  listener,
+  transcriber,
+  speaker,
+  sessions,
+  history,
   emit: (event) => {
     logEvent(event);
     ui.broadcast(event);
@@ -106,7 +125,10 @@ const token = randomBytes(16).toString("hex");
 const ui = new UiServer({
   port: config.uiPort,
   token,
-  snapshot: (): UiEvent[] => [{ type: "state", state: jarvis.state, followUp: jarvis.followUp }],
+  snapshot: (): UiEvent[] => [
+    { type: "state", state: jarvis.state, followUp: jarvis.followUp },
+    ...(sessions.record ? [sessionEvent(sessions.record)] : []),
+  ],
   onCommand: (command) => {
     if (command.type === "activate") jarvis.activate(false);
     else if (command.type === "stop") jarvis.stop();
@@ -224,6 +246,7 @@ function shutdown(): void {
   saveWatchDebug();
   mic.stop();
   jarvis.close();
+  history.close();
   speaker.close();
   kokoro?.close();
   transcriber.stop();

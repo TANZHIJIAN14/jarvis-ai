@@ -21,6 +21,10 @@ export const config = {
     "Hey Jarvis. Claude, Claude Code, jarvis-ai, file system, terminal, repo, GitHub, TypeScript, npm, API, brainstorm.",
   // Recordings with less speech than this are ignored instead of transcribed.
   minSpeechMs: Number(env.JARVIS_MIN_SPEECH_MS ?? 300),
+  // Where "switch to the … project" looks for project folders.
+  projectsDir: env.JARVIS_PROJECTS_DIR ?? join(homedir(), "Documents"),
+  // Jarvis's own data: the session history database.
+  dataDir: env.JARVIS_DATA_DIR ?? join(homedir(), "Library/Application Support/Jarvis"),
   // Folder Claude Code works in. Brainstorming lives here, away from real code.
   workspace: env.JARVIS_WORKSPACE ?? join(homedir(), "jarvis-workspace"),
   // Claude model alias; unset = the CLI's default.
