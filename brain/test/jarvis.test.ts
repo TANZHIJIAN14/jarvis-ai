@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ClaudeSession, TurnHandlers, TurnResult } from "../src/claude-session.ts";
-import { Jarvis, stripWakePhrase, type UiEvent } from "../src/jarvis.ts";
+import { isStopRequest, Jarvis, stripWakePhrase, type UiEvent } from "../src/jarvis.ts";
 import type { CaptureOptions, Listener } from "../src/listener.ts";
 import type { Speaker } from "../src/speaker.ts";
 import type { Transcriber } from "../src/transcriber.ts";
@@ -39,9 +39,10 @@ function fakeSession() {
   return { session: session as unknown as ClaudeSession, turns, interrupts: () => interrupted };
 }
 
-function setup(transcripts: string[]) {
+function setup(transcripts: string[], opts: { bargeIn?: boolean } = {}) {
   const events: UiEvent[] = [];
   const captures: CaptureOptions[] = [];
+  const watching: boolean[] = [];
   const spoken: string[] = [];
   const claude = fakeSession();
   const speaker = {
@@ -55,15 +56,20 @@ function setup(transcripts: string[]) {
     idle: async () => {},
   };
   const jarvis = new Jarvis({
-    listener: { startCapture: (o: CaptureOptions) => captures.push(o), stopCapture() {} } as unknown as Listener,
+    listener: {
+      startCapture: (o: CaptureOptions) => captures.push(o),
+      stopCapture() {},
+      watchForSpeech: (on: boolean) => watching.push(on),
+    } as unknown as Listener,
     transcriber: { transcribePcm: async () => transcripts.shift() ?? "" } as unknown as Transcriber,
     speaker: speaker as unknown as Speaker,
     newSession: () => claude.session,
     emit: (e) => events.push(e),
     chime: () => {},
+    bargeIn: opts.bargeIn,
   });
   const states = () => events.filter((e) => e.type === "state").map((e) => (e as { state: string }).state);
-  return { jarvis, events, captures, spoken, claude, states };
+  return { jarvis, events, captures, spoken, claude, states, watching };
 }
 
 test("a full turn: wake, transcribe, reply by voice, then a follow-up window", async () => {
@@ -121,4 +127,59 @@ test("strips the wake phrase and common mishearings", () => {
   assert.equal(stripWakePhrase("Hey, Garvis. What's up?"), "What's up?");
   assert.equal(stripWakePhrase("Jarvis"), "");
   assert.equal(stripWakePhrase("Tell Jarvis hello"), "Tell Jarvis hello");
+});
+
+test("talking over Jarvis interrupts it and captures what was said", async () => {
+  const { jarvis, captures, claude, watching, states } = setup(["Jarvis, explain the build", "wait, use the other branch"], { bargeIn: true });
+  jarvis.activate(true);
+  const first = jarvis.onUtterance(new Int16Array(16));
+  await tick();
+  claude.turns[0].handlers.onText!("The build has three steps. ");
+  assert.equal(jarvis.state, "speaking");
+  assert.equal(watching.at(-1), true, "watches for speech only while speaking");
+
+  jarvis.onBargeIn();
+  assert.equal(claude.interrupts(), 1);
+  assert.equal(watching.at(-1), false);
+  assert.equal(captures.at(-1)!.speechStarted, true, "the interrupting words are in the pre-roll");
+  await first;
+  assert.equal(states().at(-1), "listening");
+
+  const second = jarvis.onUtterance(new Int16Array(16));
+  await tick();
+  await tick();
+  assert.equal(claude.turns[1].text, "wait, use the other branch");
+  claude.turns[1].finish({});
+  await second;
+});
+
+test("without echo cancellation, speech never arms barge-in", async () => {
+  const { jarvis, claude, watching } = setup(["Jarvis, explain the build"]);
+  jarvis.activate(true);
+  const first = jarvis.onUtterance(new Int16Array(16));
+  await tick();
+  claude.turns[0].handlers.onText!("The build has three steps. ");
+  assert.equal(jarvis.state, "speaking");
+  assert.ok(watching.every((on) => !on));
+  jarvis.onBargeIn(); // ignored: nothing to act on
+  assert.equal(claude.interrupts(), 0);
+  claude.turns[0].finish({});
+  await first;
+});
+
+test("a bare 'stop' after interrupting goes quiet instead of asking Claude", async () => {
+  const { jarvis, claude } = setup(["Stop."]);
+  jarvis.activate(true);
+  await jarvis.onUtterance(new Int16Array(16));
+  assert.equal(claude.turns.length, 0);
+  assert.equal(jarvis.state, "idle");
+});
+
+test("recognises 'stop' requests, including repeats and filler, but not real questions", () => {
+  for (const t of ["Stop.", "Stop, man. Stop.", "Okay, that's enough.", "Hey Jarvis, wait.", "Never mind.", "Hold on a second", "Thank you."]) {
+    assert.ok(isStopRequest(t), t);
+  }
+  for (const t of ["Stop the dev server", "Wait, use the other branch", "Okay, can you start over again?", "No.", ""]) {
+    assert.ok(!isStopRequest(t), t);
+  }
 });

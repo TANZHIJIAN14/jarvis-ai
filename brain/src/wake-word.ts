@@ -1,5 +1,6 @@
 import ort from "onnxruntime-node";
 import { join } from "node:path";
+import { SMALL_MODEL_OPTIONS } from "./vad.ts";
 
 // "Hey Jarvis" detection with openWakeWord's pre-trained models, ported from its
 // streaming pipeline (openwakeword/utils.py AudioFeatures._streaming_features):
@@ -29,7 +30,7 @@ export class WakeWord {
   }
 
   static async load(modelsDir: string): Promise<WakeWord> {
-    const open = (name: string) => ort.InferenceSession.create(join(modelsDir, name));
+    const open = (name: string) => ort.InferenceSession.create(join(modelsDir, name), SMALL_MODEL_OPTIONS);
     return new WakeWord(
       await open("melspectrogram.onnx"),
       await open("embedding_model.onnx"),

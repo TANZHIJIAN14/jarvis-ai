@@ -27,6 +27,7 @@ function setup() {
       utterance = pcm;
     },
     onNoSpeech: () => events.push("no-speech"),
+    onBargeIn: () => events.push("barge-in"),
   });
   return { listener, events, utterance: () => utterance };
 }
@@ -84,4 +85,36 @@ test("maps loudness onto 0..1", () => {
   assert.equal(level(ms(10)), 0);
   assert.ok(level(ms(10, 32767)) > 0.999);
   assert.ok(Math.abs(level(ms(10, 328)) - 0.33) < 0.02); // about -40 dBFS
+});
+
+test("while watching, ~128 ms of speech in a 400 ms window is a barge-in; echo blips are not", async () => {
+  const { listener, events } = setup();
+  listener.watchForSpeech(true);
+  await listener.feed(ms(64, 100)); // the longest leftover echo measured
+  await listener.feed(ms(500));
+  assert.deepEqual(events, []);
+  // "stop" with a dip in the middle still counts
+  await listener.feed(ms(96, 100));
+  await listener.feed(ms(64));
+  await listener.feed(ms(64, 100));
+  assert.deepEqual(events, ["barge-in"]);
+  await listener.feed(ms(400, 100));
+  assert.deepEqual(events, ["barge-in"], "fires once, then stops watching");
+});
+
+test("reports how close speech came when watching ends without a barge-in", async () => {
+  const peaks: number[] = [];
+  const listener = new Listener(fakeWake(), fakeVad(), { onWatchEnd: (ms) => peaks.push(ms) });
+  listener.watchForSpeech(true);
+  await listener.feed(ms(96, 100));
+  await listener.feed(ms(500));
+  listener.watchForSpeech(false);
+  assert.deepEqual(peaks, [96]);
+});
+
+test("a capture that starts mid-speech ends on the next silence", async () => {
+  const { listener, events } = setup();
+  listener.startCapture({ preRollMs: 800, noSpeechTimeoutMs: 3000, speechStarted: true });
+  await listener.feed(ms(800));
+  assert.deepEqual(events, ["utterance"]);
 });

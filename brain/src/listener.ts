@@ -17,12 +17,17 @@ export type ListenerHandlers = {
   onSpeechStart?: () => void;
   onUtterance?: (pcm: Int16Array) => void;
   onNoSpeech?: () => void;
+  onBargeIn?: () => void; // the user talked over Jarvis (see watchForSpeech)
+  // Watching ended without a barge-in: the most speech seen in any window, for tuning.
+  onWatchEnd?: (peakSpeechMs: number) => void;
+  onWatchFrame?: (prob: number, frame: Int16Array) => void; // every VAD frame while watching (debugging)
   onLevel?: (level: number) => void; // 0..1, for the orb
 };
 
 export type CaptureOptions = {
   preRollMs: number; // audio from before capture started, e.g. the "Hey Jarvis" itself
   noSpeechTimeoutMs: number; // give up if nobody starts talking
+  speechStarted?: boolean; // the pre-roll already holds speech (barge-in): only wait for the end
 };
 
 export type ListenerOptions = {
@@ -34,6 +39,9 @@ export type ListenerOptions = {
   endSilenceMs: number; // silence after speech that ends the utterance
   maxUtteranceMs: number;
   historyMs: number; // how much audio is kept for pre-roll
+  bargeInProb: number; // VAD probability that counts as the user speaking over Jarvis
+  bargeInWindowMs: number; // sliding window the speech is counted in
+  bargeInMs: number; // speech within the window that counts as talking over Jarvis
 };
 
 export const DEFAULT_LISTENER_OPTIONS: ListenerOptions = {
@@ -45,6 +53,13 @@ export const DEFAULT_LISTENER_OPTIONS: ListenerOptions = {
   endSilenceMs: 700,
   maxUtteranceMs: 30_000,
   historyMs: 2000,
+  // Tuned on a recording of a real "stop" said over Jarvis (echo cancellation on): the word gave
+  // 5 frames (160 ms) at p 0.79-0.90, while 33 s of Jarvis's cancelled voice never reached 0.5.
+  // Leftover echo measured at most 64 ms at p > 0.7, so 128 ms keeps a 2x margin. Counting
+  // within a window (not an unbroken run) tolerates a dip mid-word.
+  bargeInProb: 0.7,
+  bargeInWindowMs: 400,
+  bargeInMs: 128,
 };
 
 type Capture = CaptureOptions & {
@@ -67,6 +82,10 @@ export class Listener {
   private capture: Capture | undefined;
   private cooldownMs = 0;
   private queue = Promise.resolve();
+  private watching = false;
+  private watchPending: Int16Array = new Int16Array(0);
+  private watchWindow: boolean[] = []; // speech flags for the last bargeInWindowMs of frames
+  private watchPeakMs = 0;
 
   constructor(wake: WakeModel, vad: VadModel, handlers: ListenerHandlers, opts: Partial<ListenerOptions> = {}) {
     this.wake = wake;
@@ -87,13 +106,33 @@ export class Listener {
 
   startCapture(opts: CaptureOptions): void {
     const preRoll = takeLast(this.history, Math.round(opts.preRollMs / MS_PER_SAMPLE));
+    this.watchForSpeech(false);
     this.vad.reset();
     this.vadPending = new Int16Array(0);
-    this.capture = { ...opts, audio: [preRoll], elapsedMs: 0, speechMs: 0, silenceMs: 0, started: false };
+    this.capture = {
+      ...opts,
+      audio: [preRoll],
+      elapsedMs: 0,
+      speechMs: 0,
+      silenceMs: 0,
+      started: opts.speechStarted ?? false,
+    };
   }
 
   stopCapture(): void {
     this.capture = undefined;
+  }
+
+  // While Jarvis is speaking: report sustained speech (with echo cancellation on, that's the
+  // user, not Jarvis). The wake word keeps working alongside.
+  watchForSpeech(on: boolean): void {
+    if (on === this.watching) return;
+    if (!on && this.watchPeakMs >= 0) this.handlers.onWatchEnd?.(this.watchPeakMs);
+    this.watching = on;
+    this.watchWindow = [];
+    this.watchPeakMs = 0;
+    this.watchPending = new Int16Array(0);
+    if (on) this.vad.reset();
   }
 
   private async process(samples: Int16Array): Promise<void> {
@@ -103,8 +142,30 @@ export class Listener {
       this.capture.audio.push(samples);
       await this.processCapture(samples);
     } else {
-      await this.processWake(samples);
+      if (this.watching) await this.processWatch(samples);
+      if (!this.capture) await this.processWake(samples);
     }
+  }
+
+  private async processWatch(samples: Int16Array): Promise<void> {
+    this.watchPending = concat(this.watchPending, samples);
+    let offset = 0;
+    for (; offset + VAD_FRAME <= this.watchPending.length; offset += VAD_FRAME) {
+      const frame = this.watchPending.subarray(offset, offset + VAD_FRAME);
+      const p = await this.vad.process(frame);
+      this.handlers.onWatchFrame?.(p, frame);
+      this.watchWindow.push(p >= this.opts.bargeInProb);
+      if (this.watchWindow.length > this.opts.bargeInWindowMs / VAD_FRAME_MS) this.watchWindow.shift();
+      const speechMs = this.watchWindow.filter(Boolean).length * VAD_FRAME_MS;
+      this.watchPeakMs = Math.max(this.watchPeakMs, speechMs);
+      if (speechMs >= this.opts.bargeInMs) {
+        this.watchPeakMs = -1; // fired: no "ended without" report
+        this.watchForSpeech(false);
+        this.handlers.onBargeIn?.();
+        return;
+      }
+    }
+    this.watchPending = this.watchPending.slice(offset);
   }
 
   private async processWake(samples: Int16Array): Promise<void> {
