@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
-import type { ClaudeSession } from "./claude-session.ts";
+import { parseCommand } from "./commands.ts";
+import type { HistoryStore } from "./history.ts";
 import type { CaptureOptions, Listener } from "./listener.ts";
 import { SentenceSplitter } from "./sentences.ts";
+import type { SessionManager } from "./sessions.ts";
 import type { Speaker } from "./speaker.ts";
 import type { Transcriber } from "./transcriber.ts";
 
@@ -20,7 +22,8 @@ export type UiEvent =
   | { type: "reply_delta"; text: string }
   | { type: "tool"; name: string; detail: string }
   | { type: "reply_done"; error?: string }
-  | { type: "notice"; text: string };
+  | { type: "notice"; text: string }
+  | { type: "session"; id: number; title: string | null; project: string };
 
 // UI -> brain.
 export type UiCommand = { type: "activate" } | { type: "stop" } | { type: "quit" };
@@ -49,14 +52,14 @@ export function isStopRequest(text: string): boolean {
   return words.length > 0 && words.length <= 10 && words.some((w) => STOP_WORDS.has(w))
     && words.every((w) => STOP_WORDS.has(w) || FILLER_WORDS.has(w));
 }
-const SESSION_IDLE_MS = 10 * 60_000; // design doc: a wake-up within 10 min continues the session
 const CHIME = "/System/Library/Sounds/Pop.aiff";
 
 export type JarvisDeps = {
   listener: Listener;
   transcriber: Transcriber;
   speaker: Speaker;
-  newSession: () => ClaudeSession;
+  sessions: SessionManager;
+  history: HistoryStore;
   emit: (event: UiEvent) => void;
   chime?: () => void;
   // Interrupt by talking over Jarvis. Needs echo cancellation, or Jarvis hears itself.
@@ -69,8 +72,6 @@ export class Jarvis {
   private deps: JarvisDeps;
   private gen = 0;
   bargeIn: boolean;
-  private session: ClaudeSession | undefined;
-  private lastTurnAt = 0;
   private turn: Promise<unknown> = Promise.resolve();
 
   constructor(deps: JarvisDeps) {
@@ -132,52 +133,89 @@ export class Jarvis {
       this.setState("idle");
       return;
     }
-    if (/^(new session|fresh start|start over)\b/i.test(text)) {
-      this.resetSession();
-      this.prepare();
-      this.deps.speaker.say("Okay, starting fresh.");
-      await this.deps.speaker.idle();
-      if (gen === this.gen) this.listen(FOLLOW_UP_CAPTURE, true);
-      return;
+    const { sessions, history } = this.deps;
+    const command = parseCommand(text);
+    switch (command.kind) {
+      case "new":
+        sessions.startNew(sessions.record?.cwd);
+        return this.say("Okay, starting fresh.", gen);
+      case "project": {
+        const path = sessions.findProject(command.name);
+        if (!path) return this.say(`I couldn't find a project called ${command.name}.`, gen);
+        const record = sessions.startNew(path);
+        return this.say(`Okay, working in ${spokenName(record.project)} now.`, gen);
+      }
+      case "resume": {
+        const found = sessions.findSession(command.query);
+        if (!found) break; // not a past conversation: a normal request ("continue the story")
+        sessions.resume(found);
+        return this.say(`Back to ${found.title ?? `our conversation from ${whenSpoken(found.lastActiveAt)}`}.`, gen);
+      }
+      case "list": {
+        const recent = history.recent(4);
+        if (recent.length === 0) return this.say("We haven't talked about anything yet.", gen);
+        const items = recent.map((s) => `${s.title ?? spokenName(s.project)}, ${whenSpoken(s.lastActiveAt)}`);
+        return this.say(`Recently: ${items.join("; ")}.`, gen);
+      }
+      case "recall": {
+        const notes = history.searchTurns(command.query, 4);
+        if (notes.length === 0) break; // Claude may still know from the current conversation
+        return this.reply(text, gen, withNotes(text, notes));
+      }
     }
     await this.reply(text, gen);
   }
 
   // Start Claude Code now so the first question doesn't wait for it.
   prepare(): void {
-    this.currentSession().warm();
+    this.deps.sessions.prepare();
   }
 
   close(): void {
-    this.session?.close();
+    this.deps.sessions.close();
   }
 
-  private async reply(text: string, gen: number): Promise<void> {
+  // A short spoken answer from Jarvis itself (no Claude), then the follow-up window.
+  private async say(text: string, gen: number): Promise<void> {
+    this.deps.speaker.say(text);
+    await this.deps.speaker.idle();
+    if (gen === this.gen) this.listen(FOLLOW_UP_CAPTURE, true);
+  }
+
+  // `prompt` is what Claude sees (the request, plus notes from history for a recall);
+  // `text` is what the user said, which is what gets recorded.
+  private async reply(text: string, gen: number, prompt = text): Promise<void> {
     this.setState("thinking");
     await this.turn; // an interrupted turn needs a moment to wind down
     if (gen !== this.gen) return;
 
     const { speaker, emit } = this.deps;
-    const session = this.currentSession();
+    const session = this.deps.sessions.forTurn();
     const splitter = new SentenceSplitter();
+    let replyText = "";
+    const tools: string[] = [];
     speaker.onFirstAudio = () => {
       if (gen === this.gen) this.setState("speaking");
     };
     emit({ type: "reply_start" });
 
-    const turn = session.ask(text, {
+    const turn = session.ask(prompt, {
       onText: (delta) => {
+        replyText += delta;
         if (gen !== this.gen) return;
         emit({ type: "reply_delta", text: delta });
         for (const sentence of splitter.push(delta)) speaker.say(sentence);
       },
       onTool: (name, input) => {
+        tools.push(`${name} ${toolDetail(input)}`.trim());
         if (gen === this.gen) emit({ type: "tool", name, detail: toolDetail(input) });
       },
     });
     this.turn = turn;
     const result = await turn;
-    this.lastTurnAt = Date.now();
+    if (!result.isError || result.interrupted) {
+      this.deps.sessions.recordTurn(text, replyText.trim(), tools, result.sessionId);
+    }
     if (gen !== this.gen) return;
 
     for (const sentence of splitter.flush()) speaker.say(sentence);
@@ -207,18 +245,7 @@ export class Jarvis {
 
   private interruptReply(): void {
     this.deps.speaker.stop();
-    if (this.session?.busy) this.session.interrupt();
-  }
-
-  private currentSession(): ClaudeSession {
-    if (this.session && Date.now() - this.lastTurnAt > SESSION_IDLE_MS) this.resetSession();
-    this.session ??= this.deps.newSession();
-    return this.session;
-  }
-
-  private resetSession(): void {
-    this.session?.close();
-    this.session = undefined;
+    if (this.deps.sessions.claude?.busy) this.deps.sessions.claude.interrupt();
   }
 
   private fail(message: string): void {
@@ -238,6 +265,28 @@ export class Jarvis {
 // The transcript starts with the wake phrase when capture began with it (pre-roll).
 export function stripWakePhrase(text: string): string {
   return text.replace(/^\W*(?:(?:hey|hi|hello|ok|okay)\W+)?(?:jarvis|jarvi|garvis|travis|jervis)\b\W*/i, "").trim();
+}
+
+// What Claude sees for "what did we decide about X": the question, plus the most relevant
+// past turns from the history store.
+function withNotes(question: string, notes: ReturnType<HistoryStore["searchTurns"]>): string {
+  const lines = notes.map(({ turn, session }) =>
+    `- ${new Date(turn.at).toDateString()}, "${session.title ?? session.project}":\n` +
+      `  User: ${turn.user.slice(0, 300)}\n  Assistant: ${turn.reply.slice(0, 600)}`);
+  return `${question}\n\n(Notes from our past conversations, most relevant first. Answer from these; say so if they don't cover it.)\n${lines.join("\n")}`;
+}
+
+// "jarvis-ai" -> "jarvis ai", for speech.
+function spokenName(project: string): string {
+  return project.replace(/[-_]+/g, " ");
+}
+
+export function whenSpoken(at: number, now = Date.now()): string {
+  const day = (t: number) => new Date(t).toDateString();
+  if (day(at) === day(now)) return "earlier today";
+  if (day(at) === day(now - 86_400_000)) return "yesterday";
+  if (now - at < 6 * 86_400_000) return `on ${new Date(at).toLocaleDateString("en-US", { weekday: "long" })}`;
+  return `on ${new Date(at).toLocaleDateString("en-US", { month: "long", day: "numeric" })}`;
 }
 
 function toolDetail(input: Record<string, unknown>): string {
