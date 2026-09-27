@@ -564,3 +564,61 @@ test("a task's report lists the files it changed, with the diff", async () => {
   await tick();
   assert.match(ctx.spoken.join(" "), /1 file changed\./);
 });
+
+test("can't reach Claude: red Error state, a low tone, and Try again asks the same question", async () => {
+  const ctx = setup(["Jarvis, what did we decide about the history window?"]);
+  ctx.jarvis.activate(true);
+  const first = ctx.jarvis.onUtterance(new Int16Array(16));
+  await tick();
+  ctx.claude.turns[0].finish({ isError: true, text: "Invalid API key · Please run /login" });
+  await first;
+  assert.equal(ctx.jarvis.state, "error");
+  assert.deepEqual(ctx.sounds.slice(-1), ["error"]);
+  const error = ctx.events.find((e) => e.type === "error") as Extract<UiEvent, { type: "error" }>;
+  assert.equal(error.reason, "signed_out");
+  assert.equal(error.command, "claude");
+  assert.match(ctx.spoken.at(-1)!, /signed out/);
+
+  ctx.jarvis.retry();
+  await tick();
+  assert.equal(ctx.claude.turns[1].text, "what did we decide about the history window?");
+  assert.equal(ctx.jarvis.state, "thinking");
+});
+
+test("a usage limit is an ordinary reply; the request waits as a task until the limit resets", async () => {
+  const ctx = setup(["Jarvis, refactor the listener"]);
+  ctx.jarvis.activate(true);
+  const reply = ctx.jarvis.onUtterance(new Int16Array(16));
+  await tick();
+  ctx.claude.turns[0].finish({ isError: true, text: "5-hour limit reached ∙ resets 3pm" });
+  await reply;
+  assert.notEqual(ctx.jarvis.state, "error");
+  assert.match(ctx.spoken.at(-1)!, /usage limit\. It resets at 3 PM, so I'll do this in the background then\./);
+  const task = lastTask(ctx.events);
+  assert.equal(task.status, "queued");
+  assert.equal(task.request, "refactor the listener");
+  assert.match(task.activity, /resets at 3 PM/);
+  assert.equal(ctx.claude.turns.length, 1, "not started before the reset");
+});
+
+test("no speech after the wake word: 'I didn't catch that.' once, then idle", () => {
+  const ctx = setup([]);
+  ctx.jarvis.activate(true);
+  ctx.jarvis.onNoSpeech();
+  assert.deepEqual(ctx.spoken, ["I didn't catch that."]);
+  assert.equal(ctx.jarvis.state, "idle");
+});
+
+test("a failed task is reported with the failing line and that no files changed", async () => {
+  const ctx = setup([]);
+  const id = ctx.jarvis.startTask("Run the e2e tests");
+  await tick();
+  ctx.claude.turns[0].finish({ isError: true, text: "Error: npm test exited with code 1" });
+  await tick();
+  await tick();
+  assert.equal(lastTask(ctx.events, id).status, "failed");
+  const report = ctx.events.find((e) => e.type === "task_report") as Extract<UiEvent, { type: "task_report" }>;
+  assert.equal(report.failed, true);
+  assert.equal(report.error, "Error: npm test exited with code 1");
+  assert.match(report.summary, /ran into a problem: Error: npm test exited with code 1\. No files were changed\./);
+});

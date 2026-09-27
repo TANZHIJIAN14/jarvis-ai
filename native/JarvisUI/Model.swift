@@ -94,6 +94,13 @@ struct Report: Identifiable {
   let title: String
   let summary: String
   let files: [FileChange]
+  let failed: Bool
+}
+
+// The red Error state: Claude can't be reached.
+struct ClaudeError {
+  let text: String
+  let command: String
 }
 
 final class JarvisModel: ObservableObject {
@@ -112,6 +119,7 @@ final class JarvisModel: ObservableObject {
   @Published var taskFiles: [Int: [FileChange]] = [:]
   @Published var taskDiffs: [Int: String] = [:]
   @Published var rules: [AllowRuleItem] = []
+  @Published var error: ClaudeError?
   @Published var reports: [Report] = [] // finished background work to show
   @Published var connected = false
   @Published var history: [HistoryItem] = [] // the History window's current search results
@@ -122,13 +130,17 @@ final class JarvisModel: ObservableObject {
     tasks.values.filter { $0.status == "running" }.sorted { $0.startedAt < $1.startedAt }
   }
 
-  // Finished tasks not yet told to the user: the green menu bar badge.
+  // Finished tasks not yet told to the user: the green menu bar badge (red when one failed).
   var unreportedCount: Int {
     tasks.values.filter { ($0.status == "done" || $0.status == "failed") && !$0.reported }.count
   }
 
+  var unreportedFailure: Bool {
+    tasks.values.contains { $0.status == "failed" && !$0.reported }
+  }
+
   var hasContent: Bool {
-    !thread.isEmpty || !notice.isEmpty || approval != nil || !reports.isEmpty || !runningTasks.isEmpty
+    !thread.isEmpty || !notice.isEmpty || approval != nil || !reports.isEmpty || !runningTasks.isEmpty || error != nil
   }
 
   // "jarvis-ai · Listening"
@@ -139,6 +151,7 @@ final class JarvisModel: ObservableObject {
     case "thinking": return "Thinking"
     case "speaking": return "Speaking"
     case "asking": return "Waiting for your answer"
+    case "error": return "Something's wrong"
     default: return "Ready"
     }
   }
@@ -148,6 +161,7 @@ final class JarvisModel: ObservableObject {
     case "state":
       state = event["state"] as? String ?? "idle"
       followUp = event["followUp"] as? Bool ?? false
+      if state != "error" { error = nil }
       if state == "listening" {
         listeningSince = Date()
         level = 0
@@ -172,6 +186,8 @@ final class JarvisModel: ObservableObject {
         $0.finished = true
         $0.error = event["error"] as? String
       }
+    case "error":
+      error = ClaudeError(text: event["text"] as? String ?? "", command: event["command"] as? String ?? "claude")
     case "notice":
       notice = event["text"] as? String ?? ""
     case "approval":
@@ -210,7 +226,8 @@ final class JarvisModel: ObservableObject {
       let files = (event["files"] as? [[String: Any]] ?? []).map { f in
         FileChange(path: f["path"] as? String ?? "", added: f["added"] as? Int ?? 0, removed: f["removed"] as? Int ?? 0)
       }
-      reports.append(Report(id: id, title: event["title"] as? String ?? "", summary: event["summary"] as? String ?? "", files: files))
+      reports.append(Report(id: id, title: event["title"] as? String ?? "", summary: event["summary"] as? String ?? "",
+                            files: files, failed: event["failed"] as? Bool ?? false))
       taskResults[id] = event["summary"] as? String ?? ""
       taskFiles[id] = files
       taskDiffs[id] = event["diff"] as? String ?? ""

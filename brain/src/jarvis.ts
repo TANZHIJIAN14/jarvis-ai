@@ -4,6 +4,7 @@ import type { ApprovalDecision, ApprovalRequest } from "./approval-server.ts";
 import { describeActivity } from "./activity.ts";
 import { describeRequest, isDestructive, parseAnswer } from "./approvals.ts";
 import { ChangeTracker, spokenChanges, type FileChange } from "./changes.ts";
+import { classifyClaudeError, unreachableMessage, type ClaudeProblem } from "./errors.ts";
 import { parseCommand } from "./commands.ts";
 import type { HistoryStore } from "./history.ts";
 import { AllowRules, describeRule, ruleFor, type AllowRule } from "./rules.ts";
@@ -17,7 +18,8 @@ import type { Transcriber } from "./transcriber.ts";
 // Every activation bumps `gen`; async work from an older generation drops its result,
 // which is how "Hey Jarvis" or a click interrupts whatever Jarvis was doing.
 
-export type JarvisState = "idle" | "listening" | "transcribing" | "thinking" | "speaking" | "asking";
+// "error": Claude can't be reached; the question is kept for Try again.
+export type JarvisState = "idle" | "listening" | "transcribing" | "thinking" | "speaking" | "asking" | "error";
 
 // Brain -> UI messages. native/JarvisUI.swift decodes the same shapes.
 export type UiEvent =
@@ -38,7 +40,10 @@ export type UiEvent =
       startedAt: number; reported: boolean; request: string; origin: "voice" | "window"; cwd: string;
       claudeSessionId: string | null }
   | { type: "task_step"; taskId: number; tool: string; detail: string; at: number }
-  | { type: "task_report"; taskId: number; title: string; summary: string; files: FileChange[]; diff: string }
+  | { type: "task_report"; taskId: number; title: string; summary: string; files: FileChange[]; diff: string;
+      failed: boolean; error?: string }
+  // Claude can't be reached (the red Error state): what to say, and the command that fixes it.
+  | { type: "error"; reason: Extract<ClaudeProblem, { kind: "unreachable" }>["reason"]; text: string; command: string }
   // Saved "Always allow" rules, for Settings.
   | { type: "rules"; rules: Array<{ label: string; folder: string }> }
   // The History window: a search's results, and one conversation opened.
@@ -62,6 +67,7 @@ export type UiCommand =
   | { type: "quit" }
   | { type: "approve"; id: number; allow: boolean; always?: boolean }
   | { type: "rule_remove"; index: number }
+  | { type: "retry" } // Try again, from the Error state
   | { type: "report_seen"; taskId: number }
   // The Agents window: start, steer and stop background tasks without speaking.
   | { type: "task_new"; text: string; project?: string }
@@ -106,12 +112,14 @@ export type JarvisDeps = {
   history: HistoryStore;
   emit: (event: UiEvent) => void;
   // "wake": Jarvis is listening; "done": a background task finished (its report waits for the next wake).
-  sound?: (name: "wake" | "done") => void;
+  sound?: (name: Sound) => void;
   rules?: AllowRules; // "Always allow" answers; in memory when absent
 
   // Interrupt by talking over Jarvis. Needs echo cancellation, or Jarvis hears itself.
   bargeIn?: boolean;
 };
+
+type Sound = "wake" | "done" | "error";
 
 type Approval = {
   id: number;
@@ -147,6 +155,8 @@ export class Jarvis {
   private asking: Approval | undefined;
   private nextApprovalId = 1;
   private rules: AllowRules;
+  private failedRequest: { text: string; prompt: string } | undefined; // kept for Try again
+  private taskNotBefore = new Map<number, number>(); // queued until a usage limit resets
   private changes = new Map<number, ChangeTracker>(); // per session: files touched, for task reports
 
   constructor(deps: JarvisDeps) {
@@ -214,7 +224,10 @@ export class Jarvis {
       this.answer(false, "The user didn't answer, so this was not approved.");
       return;
     }
-    if (!this.followUp) this.deps.emit({ type: "notice", text: "Didn't hear anything" });
+    if (!this.followUp) {
+      this.deps.emit({ type: "notice", text: "Didn't catch that" });
+      this.deps.speaker.say("I didn't catch that.");
+    }
     this.resolveHold(); // woke Jarvis, then said nothing: treat it as "stop"
     this.setState("idle");
   }
@@ -378,17 +391,17 @@ export class Jarvis {
       sessions.recordTurn(sessionId, text, replyText.trim(), tools, result.sessionId);
     }
     if (sessions.isBackground(sessionId)) {
-      this.afterBackgroundTurn(sessionId, replyText, result.isError && !result.interrupted);
+      this.afterBackgroundTurn(sessionId, replyText, result.isError && !result.interrupted, result.text);
       return;
     }
     if (gen !== this.gen) return;
 
     for (const sentence of splitter.flush()) speaker.say(sentence);
     if (result.isError && !result.interrupted) {
-      emit({ type: "reply_done", error: result.text });
-      speaker.say(/auth|log ?in/i.test(result.text)
-        ? "I can't reach Claude. Please log in to Claude Code again."
-        : "Sorry, something went wrong.");
+      const problem = classifyClaudeError(result.text);
+      if (problem.kind === "unreachable") return this.unreachable(problem.reason, text, prompt);
+      emit({ type: "reply_done", error: problem.kind === "limit" ? undefined : result.text });
+      speaker.say(problem.kind === "limit" ? this.limitReached(problem, prompt) : "Sorry, something went wrong.");
     } else {
       emit({ type: "reply_done" });
     }
@@ -400,6 +413,39 @@ export class Jarvis {
     } else {
       this.listen(FOLLOW_UP_CAPTURE, true); // answer back without saying "Hey Jarvis" again
     }
+  }
+
+  // The red Error state: say what's wrong once, with a low tone, and keep the question for Try again.
+  private async unreachable(reason: Extract<ClaudeProblem, { kind: "unreachable" }>["reason"], text: string,
+                            prompt: string): Promise<void> {
+    const { speaker, emit } = this.deps;
+    this.failedRequest = { text, prompt };
+    emit({ type: "reply_done" });
+    speaker.onFirstAudio = undefined;
+    this.sound("error");
+    this.setState("error");
+    const message = unreachableMessage(reason);
+    emit({ type: "error", reason, text: message, command: "claude" });
+    speaker.say(message);
+    await speaker.idle();
+  }
+
+  // Try again: asks the kept question once more.
+  retry(): void {
+    const failed = this.failedRequest;
+    if (!failed || this.state !== "error") return;
+    this.failedRequest = undefined;
+    this.deps.speaker.stop();
+    const gen = ++this.gen;
+    void this.reply(failed.text, gen, failed.prompt);
+  }
+
+  // A usage limit is an ordinary reply: say so, and queue the request as a task for when it resets.
+  private limitReached(problem: Extract<ClaudeProblem, { kind: "limit" }>, prompt: string): string {
+    if (!problem.resetAt) return "You've reached your Claude usage limit, so I can't do that right now. Please ask again once it resets.";
+    this.startTask(prompt, undefined, { cwd: this.deps.sessions.record?.cwd, notBefore: problem.resetAt + 60_000,
+      waiting: `Starts after the usage limit resets at ${problem.resetText}` });
+    return `You've reached your Claude usage limit. It resets at ${problem.resetText}, so I'll do this in the background then.`;
   }
 
   private listen(opts: CaptureOptions, followUp: boolean, state: JarvisState = "listening"): void {
@@ -598,9 +644,9 @@ export class Jarvis {
 
   // "New task…": runs in the background, in the named project folder if one matches.
   // Queued when all background slots are busy. Returns the task's id.
-  startTask(text: string, project?: string): number {
+  startTask(text: string, project?: string, opts: { cwd?: string; notBefore?: number; waiting?: string } = {}): number {
     const { sessions, history } = this.deps;
-    const cwd = (project && sessions.findProject(project)) || sessions.defaultCwd;
+    const cwd = opts.cwd ?? ((project && sessions.findProject(project)) || sessions.defaultCwd);
     const record = history.createSession(cwd, basename(cwd));
     this.tasks.set(record.id, {
       type: "task",
@@ -608,15 +654,19 @@ export class Jarvis {
       title: titleFrom(text),
       project: record.project,
       status: "queued",
-      activity: "",
+      activity: opts.waiting ?? "",
       startedAt: Date.now(),
       reported: false,
       request: text,
-      origin: "window",
+      origin: opts.notBefore ? "voice" : "window",
       cwd,
       claudeSessionId: null,
     });
     this.taskPrompts.set(record.id, text);
+    if (opts.notBefore) {
+      this.taskNotBefore.set(record.id, opts.notBefore);
+      setTimeout(() => this.startQueued(), Math.max(0, opts.notBefore - Date.now())).unref();
+    }
     this.deps.emit(this.tasks.get(record.id)!);
     this.startQueued();
     return record.id;
@@ -661,13 +711,15 @@ ${text}`.trim());
     const { sessions, history } = this.deps;
     for (const task of [...this.tasks.values()]) {
       if (task.status !== "queued" || !sessions.canStartBackground()) continue;
+      if ((this.taskNotBefore.get(task.id) ?? 0) > Date.now()) continue;
+      this.taskNotBefore.delete(task.id);
       const record = history.get(task.id);
       const prompt = this.taskPrompts.get(task.id);
       if (!record || prompt === undefined) continue;
       this.taskPrompts.delete(task.id);
       sessions.startBackground(record.cwd, record.turns > 0 ? record : { ...record, claudeSessionId: null });
       this.changes.set(task.id, new ChangeTracker(record.cwd));
-      this.updateTask(task.id, { status: "running", startedAt: Date.now() });
+      this.updateTask(task.id, { status: "running", startedAt: Date.now(), activity: "" });
       void this.runTaskTurn(task.id, prompt, prompt);
     }
   }
@@ -688,11 +740,11 @@ ${text}`.trim());
       },
     });
     if (!result.isError || result.interrupted) sessions.recordTurn(id, userText, replyText.trim(), tools, result.sessionId);
-    this.afterBackgroundTurn(id, replyText, result.isError && !result.interrupted);
+    this.afterBackgroundTurn(id, replyText, result.isError && !result.interrupted, result.text);
   }
 
   // A background turn ended: stop it, carry on with a note, or finish and report.
-  private afterBackgroundTurn(id: number, reply: string, failed: boolean): void {
+  private afterBackgroundTurn(id: number, reply: string, failed: boolean, error = ""): void {
     const control = this.taskControl.get(id);
     this.taskControl.delete(id);
     if (control?.stop) {
@@ -703,7 +755,7 @@ ${text}`.trim());
       void this.runTaskTurn(id, `A note from the user while you were working: ${note}\nTake it into account and carry on.`, note);
       return;
     } else {
-      this.backgroundDone(id, reply, failed);
+      this.backgroundDone(id, reply, failed, error);
     }
     this.startQueued();
   }
@@ -723,7 +775,7 @@ ${text}`.trim());
     });
   }
 
-  private backgroundDone(sessionId: number, reply: string, failed: boolean): void {
+  private backgroundDone(sessionId: number, reply: string, failed: boolean, error = ""): void {
     const { sessions, history, emit } = this.deps;
     sessions.finishBackground(sessionId);
     const name = history.get(sessionId)?.title ?? "your earlier request";
@@ -733,16 +785,19 @@ ${text}`.trim());
     this.changes.delete(sessionId);
     const { files, diff } = tracker?.collect() ?? { files: [], diff: "" };
     const changed = tracker && tracker.touched > 0 ? ` ${spokenChanges(files)}` : "";
+    // A failed task: what failed, whether anything changed, and the failing line.
+    const failingLine = (error || reply).split("\n").map((l) => l.trim()).filter(Boolean).at(-1)?.slice(0, 200);
     const text = failed
-      ? `${name} ran into a problem.${files.length > 0 ? changed : " No files were changed."}`
+      ? `${name} ran into a problem${failingLine ? `: ${failingLine.replace(/\.$/, "")}` : ""}.${files.length > 0 ? changed : " No files were changed."}`
       : `Finished ${name}. ${lead}${changed}`.replace(/\s+/g, " ").trim();
     this.updateTask(sessionId, { status: failed ? "failed" : "done", activity: "" });
-    emit({ type: "task_report", taskId: sessionId, title: name, summary: reply.trim() || text, files, diff });
+    emit({ type: "task_report", taskId: sessionId, title: name, summary: failed ? text : reply.trim() || text, files, diff,
+      failed, ...(failed && failingLine ? { error: failingLine } : {}) });
     this.unreported.push({ taskId: sessionId, text });
     this.sound("done"); // the report waits for the next "Hey Jarvis"
   }
 
-  private sound(name: "wake" | "done"): void {
+  private sound(name: Sound): void {
     (this.deps.sound ?? playSound)(name);
   }
 
@@ -799,8 +854,12 @@ function toolDetail(input: Record<string, unknown>): string {
   return String(detail).split("\n")[0].slice(0, 80);
 }
 
-const SOUNDS = { wake: "/System/Library/Sounds/Pop.aiff", done: "/System/Library/Sounds/Glass.aiff" };
+const SOUNDS = {
+  wake: "/System/Library/Sounds/Pop.aiff",
+  done: "/System/Library/Sounds/Glass.aiff",
+  error: "/System/Library/Sounds/Basso.aiff", // the short low tone of the Error state
+};
 
-function playSound(name: "wake" | "done"): void {
+function playSound(name: Sound): void {
   spawn("afplay", ["-v", "0.4", SOUNDS[name]], { stdio: "ignore" }).on("error", () => {});
 }

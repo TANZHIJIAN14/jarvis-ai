@@ -255,7 +255,7 @@ private struct TaskDetail: View {
             }
             ForEach(steps) { step in
               HStack(alignment: .firstTextBaseline, spacing: 12) {
-                Text(time(step.at)).font(.system(size: 13).monospacedDigit()).foregroundStyle(Theme.secondary).frame(width: 48, alignment: .leading)
+                Text(time(step.at)).font(.system(size: 13).monospacedDigit()).foregroundStyle(Theme.secondary).fixedSize().frame(width: 64, alignment: .leading)
                 Text(step.tool).font(.system(size: 13)).foregroundStyle(Theme.secondary).frame(width: 80, alignment: .leading)
                 Text(step.detail).font(.system(size: 12, design: .monospaced)).textSelection(.enabled)
               }

@@ -8,6 +8,7 @@ enum MenuBarIcon {
   enum Badge {
     case news(Int)
     case needsYou(Int)
+    case failed(Int) // a background task failed
   }
 
   static func image(working: Bool, badge: Badge?) -> NSImage {
@@ -34,6 +35,7 @@ enum MenuBarIcon {
         let (count, fill): (Int, NSColor) = switch badge {
         case .news(let n): (n, NSColor(hex: 0x1E7F52))
         case .needsYou(let n): (n, NSColor(hex: 0xB86E00))
+        case .failed(let n): (n, NSColor(hex: 0xB8412F))
         }
         let pill = NSBezierPath(roundedRect: NSRect(x: 19, y: 0, width: 16, height: 16), xRadius: 8, yRadius: 8)
         fill.setFill()

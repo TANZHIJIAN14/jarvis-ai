@@ -21,6 +21,7 @@ struct JarvisView: View {
   var onApprove: (Int, Bool, Bool) -> Void
   var onReportSeen: (Int) -> Void
   var onOpenAgents: (Int?) -> Void
+  var send: ([String: Any]) -> Void
 
   var body: some View {
     VStack(spacing: 4) {
@@ -30,7 +31,7 @@ struct JarvisView: View {
         .help(model.state == "idle" ? "Talk to Jarvis" : "Stop")
       statusLine
       if model.hasContent || model.state != "idle" {
-        Panel(model: model, onApprove: onApprove, onReportSeen: onReportSeen, onOpenAgents: onOpenAgents)
+        Panel(model: model, onApprove: onApprove, onReportSeen: onReportSeen, onOpenAgents: onOpenAgents, send: send)
           .padding(.top, 6)
           .transition(.opacity.combined(with: .move(edge: .top)))
       }
@@ -47,7 +48,8 @@ struct JarvisView: View {
         Text("\(model.project) · ").foregroundStyle(Theme.secondary)
       }
       Text(model.stateLabel)
-        .foregroundStyle(model.state == "asking" ? Theme.needsYouText : model.state == "idle" ? Theme.secondary : Theme.running)
+        .foregroundStyle(model.state == "asking" ? Theme.needsYouText : model.state == "error" ? Theme.failed
+          : model.state == "idle" ? Theme.secondary : Theme.running)
     }
     .font(.system(size: 12))
     .padding(.horizontal, 10)
@@ -122,6 +124,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // objectWillChange fires before the change lands; read the model on the next turn.
     DispatchQueue.main.async { [self] in
       let badge: MenuBarIcon.Badge? = model.approval != nil ? .needsYou(1)
+        : model.unreportedFailure ? .failed(model.unreportedCount)
         : model.unreportedCount > 0 ? .news(model.unreportedCount) : nil
       statusItem.button?.image = MenuBarIcon.image(working: !model.runningTasks.isEmpty, badge: badge)
       rebuildMenu()
@@ -150,7 +153,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self?.model.dismissReport(id)
         self?.brain.send(["type": "report_seen", "taskId": id])
       },
-      onOpenAgents: { [weak self] id in self?.agents.show(selecting: id) }))
+      onOpenAgents: { [weak self] id in self?.agents.show(selecting: id) },
+      send: { [weak self] command in self?.brain.send(command) }))
     if let screen = NSScreen.main?.visibleFrame {
       panel.setFrameTopLeftPoint(NSPoint(x: screen.midX - (Theme.panelWidth + 40) / 2, y: screen.maxY - 8))
     }
