@@ -35,7 +35,17 @@ export type UiEvent =
       startedAt: number; reported: boolean; request: string; origin: "voice" | "window"; cwd: string;
       claudeSessionId: string | null }
   | { type: "task_step"; taskId: number; tool: string; detail: string; at: number }
-  | { type: "task_report"; taskId: number; title: string; summary: string };
+  | { type: "task_report"; taskId: number; title: string; summary: string }
+  // The History window: a search's results, and one conversation opened.
+  | { type: "history_results"; query: string; project: string | null; projects: string[]; sessions: HistoryItem[] }
+  | { type: "history_detail"; id: number; turns: Array<{ at: number; user: string; reply: string; tools: string[] }> };
+
+export type HistoryItem = {
+  id: number; title: string | null; summary: string | null; project: string; cwd: string; startedAt: number;
+  lastActiveAt: number; turns: number; claudeSessionId: string | null;
+  current: boolean; // the conversation the next "Hey Jarvis" goes to
+  task: boolean; // a background task: opens in the Agents window
+};
 
 export type TaskStatus = "queued" | "running" | "done" | "failed" | "stopped";
 type TaskEvent = Extract<UiEvent, { type: "task" }>;
@@ -50,7 +60,11 @@ export type UiCommand =
   // The Agents window: start, steer and stop background tasks without speaking.
   | { type: "task_new"; text: string; project?: string }
   | { type: "task_note"; taskId: number; text: string }
-  | { type: "task_stop"; taskId: number };
+  | { type: "task_stop"; taskId: number }
+  // The History window: search, open a conversation, and make it the one "Hey Jarvis" continues.
+  | { type: "history_query"; query: string; project?: string }
+  | { type: "history_open"; id: number }
+  | { type: "history_continue"; id: number };
 
 const WAKE_CAPTURE: CaptureOptions = { preRollMs: 1500, noSpeechTimeoutMs: 5000 };
 const CLICK_CAPTURE: CaptureOptions = { preRollMs: 200, noSpeechTimeoutMs: 6000 };
@@ -507,6 +521,41 @@ export class Jarvis {
     };
     this.tasks.set(id, updated);
     this.deps.emit(updated);
+  }
+
+  // --- The History window ---
+
+  historyQuery(query: string, project?: string): void {
+    const { history, sessions } = this.deps;
+    const current = sessions.record?.id;
+    this.deps.emit({
+      type: "history_results",
+      query,
+      project: project ?? null,
+      projects: history.projects(),
+      sessions: history.search(query, { project }).map((s) => ({
+        ...s,
+        current: s.id === current,
+        task: this.tasks.has(s.id),
+      })),
+    });
+  }
+
+  historyOpen(id: number): void {
+    this.deps.emit({ type: "history_detail", id, turns: this.deps.history.transcript(id) });
+  }
+
+  // "Continue with Jarvis": the next "Hey Jarvis" goes to that conversation.
+  historyContinue(id: number): void {
+    const { history, sessions, emit } = this.deps;
+    const record = history.get(id);
+    if (!record) return;
+    if (sessions.isBackground(id)) {
+      emit({ type: "notice", text: "That one is still working in the background." });
+      return;
+    }
+    if (sessions.record?.id !== id) sessions.resume(record);
+    emit({ type: "notice", text: `Your next “Hey Jarvis” continues “${record.title ?? record.project}”.` });
   }
 
   // --- Background tasks started, steered and stopped from the Agents window ---

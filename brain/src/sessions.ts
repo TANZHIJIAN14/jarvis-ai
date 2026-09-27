@@ -34,7 +34,8 @@ export type SessionManagerDeps = {
 
 export class SessionManager {
   private deps: SessionManagerDeps;
-  private current: { record: SessionRecord; claude: ClaudeSession } | undefined;
+  // `since`: when this session became current. A resumed old session counts as active from then.
+  private current: { record: SessionRecord; claude: ClaudeSession; since: number } | undefined;
   private backgrounded = new Map<number, { record: SessionRecord; claude: ClaudeSession }>();
   private pending: Promise<unknown>[] = []; // titles and summaries in flight
 
@@ -57,7 +58,8 @@ export class SessionManager {
   // The session for the next request, applying the 10-minute rule.
   forTurn(): ClaudeSession {
     const record = this.record;
-    const idle = record && record.turns > 0 && this.now() - record.lastActiveAt > (this.deps.idleMs ?? IDLE_MS);
+    const lastActive = record && Math.max(record.lastActiveAt, this.current!.since);
+    const idle = record && record.turns > 0 && this.now() - lastActive! > (this.deps.idleMs ?? IDLE_MS);
     if (!this.current || idle) this.startNew(this.current?.record.cwd ?? this.deps.defaultCwd);
     return this.current!.claude;
   }
@@ -70,7 +72,7 @@ export class SessionManager {
   startNew(cwd = this.deps.defaultCwd): SessionRecord {
     this.finishCurrent();
     const record = this.deps.history.createSession(cwd, basename(cwd), this.now());
-    this.current = { record, claude: this.deps.newClaude({ cwd, sessionId: record.id }) };
+    this.current = { record, claude: this.deps.newClaude({ cwd, sessionId: record.id }), since: this.now() };
     this.current.claude.warm();
     this.deps.onChange?.(record);
     return record;
@@ -79,7 +81,7 @@ export class SessionManager {
   resume(record: SessionRecord): void {
     this.finishCurrent();
     const claude = this.deps.newClaude({ cwd: record.cwd, resume: record.claudeSessionId ?? undefined, sessionId: record.id });
-    this.current = { record, claude };
+    this.current = { record, claude, since: this.now() };
     claude.warm();
     this.deps.onChange?.(record);
   }
@@ -210,7 +212,8 @@ export class SessionManager {
     this.track(
       ask(
         "Summarize the conversation on stdin in 2 or 3 plain sentences for someone looking back at it later: " +
-          "what it was about, what was decided, and anything left open. Reply with only the summary.",
+          "what it was about and what was decided. Then, for each thing left open or unconfirmed, add a line " +
+          "starting with \"Open: \" (none if nothing is open). Reply with only the summary.",
         text,
       ).then((summary) => this.deps.history.update(record.id, { summary })),
     );

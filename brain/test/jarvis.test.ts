@@ -498,3 +498,26 @@ test("a note to a finished task asks a follow-up in the same conversation", asyn
   assert.equal(lastTask(ctx.events, id).status, "running");
   assert.equal(lastTask(ctx.events, id).reported, false);
 });
+
+test("History window: search lists past conversations, and Continue makes the next wake go there", async () => {
+  const history = new HistoryStore(":memory:");
+  const old = history.createSession("/tmp/jarvis-workspace", "jarvis-workspace", 1000);
+  history.addTurn(old.id, "plan transport to Sepang", "Take the train", [], 1000);
+  history.update(old.id, { title: "Sepang trip", claudeSessionId: "claude-old" });
+  const { jarvis, events, claudeStarts } = setup([], { history });
+  jarvis.prepare();
+
+  jarvis.historyQuery("sepang");
+  const results = events.at(-1) as Extract<UiEvent, { type: "history_results" }>;
+  assert.deepEqual(results.sessions.map((s) => [s.title, s.current]), [["Sepang trip", false]]);
+  assert.deepEqual(results.projects, ["jarvis-workspace"]);
+
+  jarvis.historyOpen(old.id);
+  assert.deepEqual((events.at(-1) as Extract<UiEvent, { type: "history_detail" }>).turns.map((t) => t.reply), ["Take the train"]);
+
+  jarvis.historyContinue(old.id);
+  assert.equal(claudeStarts.at(-1)!.resume, "claude-old");
+  assert.match((events.at(-1) as { text: string }).text, /Sepang trip/);
+  jarvis.historyQuery("");
+  assert.equal((events.at(-1) as Extract<UiEvent, { type: "history_results" }>).sessions[0].current, true);
+});

@@ -77,3 +77,17 @@ test("finds project folders from how they're said", () => {
   assert.equal(sessions.findProject("personal portfolio"), join(projectsDir, "Personal portfolio"));
   assert.equal(sessions.findProject("kubernetes"), undefined);
 });
+
+test("a resumed old session is kept for the next turn, not replaced by the 10-minute rule", () => {
+  const { sessions, started, advance } = setup();
+  sessions.forTurn();
+  sessions.recordTurn(sessions.record!.id, "plan transport to Sepang", "Take the train", [], "claude-abc");
+  const old = sessions.record!;
+  advance(3 * 86_400_000);
+  sessions.startNew();
+  sessions.resume(old);
+  advance(60_000);
+  sessions.forTurn();
+  assert.equal(sessions.record!.id, old.id);
+  assert.equal(started.length, 3);
+});

@@ -62,3 +62,23 @@ test("phrases permission requests for speech and reads yes/no answers", () => {
   for (const t of ["No.", "Nope", "Don't do that", "No, okay, don't"]) assert.equal(parseAnswer(t), "no", t);
   assert.equal(parseAnswer("What does it do?"), undefined);
 });
+
+test("History window search: every word must match, newest first, filtered by project", () => {
+  const h = new HistoryStore(":memory:");
+  const voice = h.createSession("/p/jarvis-ai", "jarvis-ai", 1000);
+  h.addTurn(voice.id, "which kokoro voice sounds best", "George sounds most like Jarvis", [], 1000);
+  h.update(voice.id, { title: "Choosing the Kokoro voice" });
+  const trip = h.createSession("/w", "workspace", 2000);
+  h.addTurn(trip.id, "plan transport to Sepang", "Take the KLIA Ekspres", [], 2000);
+  const speed = h.createSession("/p/jarvis-ai", "jarvis-ai", 3000);
+  h.addTurn(speed.id, "the voice is too fast", "Set the speed to 1.0", [], 3000);
+  h.createSession("/w", "workspace", 4000); // never used
+
+  assert.deepEqual(h.search("").map((s) => s.id), [speed.id, trip.id, voice.id]);
+  assert.deepEqual(h.search("voice").map((s) => s.id), [speed.id, voice.id]);
+  assert.deepEqual(h.search("voice george").map((s) => s.id), [voice.id]);
+  assert.deepEqual(h.search("KLIA").map((s) => s.id), [trip.id]);
+  assert.deepEqual(h.search("", { project: "workspace" }).map((s) => s.id), [trip.id]);
+  assert.deepEqual(h.search("nothing like this"), []);
+  assert.deepEqual(h.projects(), ["jarvis-ai", "workspace"]);
+});

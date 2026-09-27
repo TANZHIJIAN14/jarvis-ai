@@ -144,6 +144,9 @@ const ui = new UiServer({
     else if (command.type === "task_new") jarvis.startTask(command.text, command.project);
     else if (command.type === "task_note") jarvis.noteTask(command.taskId, command.text);
     else if (command.type === "task_stop") jarvis.stopTask(command.taskId);
+    else if (command.type === "history_query") jarvis.historyQuery(command.query, command.project);
+    else if (command.type === "history_open") jarvis.historyOpen(command.id);
+    else if (command.type === "history_continue") jarvis.historyContinue(command.id);
   },
 });
 await ui.start();

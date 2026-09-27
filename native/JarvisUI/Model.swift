@@ -47,6 +47,34 @@ struct Approval {
   let taskId: Int?
 }
 
+// A past conversation in the History window (HistoryItem in brain/src/jarvis.ts).
+struct HistoryItem: Identifiable {
+  let id: Int
+  let title: String?
+  let summary: String?
+  let project: String
+  let cwd: String
+  let startedAt: Date
+  let lastActiveAt: Date
+  let turns: Int
+  let claudeSessionId: String?
+  let current: Bool
+  let task: Bool
+
+  var displayTitle: String { title ?? "Untitled conversation" }
+  var resumeCommand: String? {
+    claudeSessionId.map { "cd \"\(cwd)\" && claude --resume \($0)" }
+  }
+}
+
+struct HistoryTurn: Identifiable {
+  let id = UUID()
+  let at: Date
+  let user: String
+  let reply: String
+  let tools: [String]
+}
+
 struct Report: Identifiable {
   let id: Int // the task's id
   let title: String
@@ -68,6 +96,9 @@ final class JarvisModel: ObservableObject {
   @Published var taskResults: [Int: String] = [:] // what each finished task reported
   @Published var reports: [Report] = [] // finished background work to show
   @Published var connected = false
+  @Published var history: [HistoryItem] = [] // the History window's current search results
+  @Published var historyProjects: [String] = []
+  @Published var historyDetail: (id: Int, turns: [HistoryTurn])?
 
   var runningTasks: [TaskItem] {
     tasks.values.filter { $0.status == "running" }.sorted { $0.startedAt < $1.startedAt }
@@ -159,6 +190,28 @@ final class JarvisModel: ObservableObject {
       reports.removeAll { $0.id == id }
       reports.append(Report(id: id, title: event["title"] as? String ?? "", summary: event["summary"] as? String ?? ""))
       taskResults[id] = event["summary"] as? String ?? ""
+    case "history_results":
+      historyProjects = event["projects"] as? [String] ?? []
+      history = (event["sessions"] as? [[String: Any]] ?? []).map { s in
+        HistoryItem(
+          id: s["id"] as? Int ?? 0,
+          title: s["title"] as? String,
+          summary: s["summary"] as? String,
+          project: s["project"] as? String ?? "",
+          cwd: s["cwd"] as? String ?? "",
+          startedAt: date(s["startedAt"]),
+          lastActiveAt: date(s["lastActiveAt"]),
+          turns: s["turns"] as? Int ?? 0,
+          claudeSessionId: s["claudeSessionId"] as? String,
+          current: s["current"] as? Bool ?? false,
+          task: s["task"] as? Bool ?? false)
+      }
+    case "history_detail":
+      let turns = (event["turns"] as? [[String: Any]] ?? []).map { t in
+        HistoryTurn(at: date(t["at"]), user: t["user"] as? String ?? "", reply: t["reply"] as? String ?? "",
+                    tools: t["tools"] as? [String] ?? [])
+      }
+      historyDetail = (event["id"] as? Int ?? 0, turns)
     case "session":
       project = (event["project"] as? String ?? "")
       sessionTitle = event["title"] as? String
@@ -169,6 +222,11 @@ final class JarvisModel: ObservableObject {
 
   func dismissReport(_ id: Int) {
     reports.removeAll { $0.id == id }
+  }
+
+  // Milliseconds since 1970, as the brain sends times.
+  private func date(_ value: Any?) -> Date {
+    Date(timeIntervalSince1970: ((value as? Double) ?? Double(value as? Int ?? 0)) / 1000)
   }
 
   private func updateLast(_ change: (inout Exchange) -> Void) {
