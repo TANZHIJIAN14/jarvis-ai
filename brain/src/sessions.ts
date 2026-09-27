@@ -27,6 +27,7 @@ export type SessionManagerDeps = {
   ask?: Ask; // titles and summaries; skipped when absent
   defaultCwd: string;
   projectsDir: string;
+  extraProjects?: () => string[]; // folders added in Settings
   onChange?: (session: SessionRecord) => void;
   now?: () => number;
   idleMs?: number;
@@ -38,6 +39,7 @@ export class SessionManager {
   private current: { record: SessionRecord; claude: ClaudeSession; since: number } | undefined;
   private backgrounded = new Map<number, { record: SessionRecord; claude: ClaudeSession }>();
   private pending: Promise<unknown>[] = []; // titles and summaries in flight
+  maxBackground = MAX_BACKGROUND; // Settings: tasks at once
 
   constructor(deps: SessionManagerDeps) {
     this.deps = deps;
@@ -90,7 +92,7 @@ export class SessionManager {
   // Undefined when there's nothing running or no room for another background task.
   detach(): SessionRecord | undefined {
     const current = this.current;
-    if (!current?.claude.busy || this.backgrounded.size >= MAX_BACKGROUND) return undefined;
+    if (!current?.claude.busy || this.backgrounded.size >= this.maxBackground) return undefined;
     this.backgrounded.set(current.record.id, current);
     this.current = undefined;
     return current.record;
@@ -108,7 +110,7 @@ export class SessionManager {
   }
 
   canStartBackground(): boolean {
-    return this.backgrounded.size < MAX_BACKGROUND;
+    return this.backgrounded.size < this.maxBackground;
   }
 
   backgroundClaude(id: number): ClaudeSession | undefined {
@@ -147,8 +149,12 @@ export class SessionManager {
     const wanted = normalize(spoken);
     if (!wanted) return undefined;
     let best: { path: string; score: number } | undefined;
-    for (const name of readdirSync(this.deps.projectsDir)) {
-      const path = join(this.deps.projectsDir, name);
+    const folders = [
+      ...(this.deps.extraProjects?.() ?? []),
+      ...readdirSync(this.deps.projectsDir).map((name) => join(this.deps.projectsDir, name)),
+    ];
+    for (const path of folders) {
+      const name = basename(path);
       if (name.startsWith(".") || !isDirectory(path)) continue;
       const have = normalize(name);
       const score = have === wanted ? 3 : have.startsWith(wanted) || wanted.startsWith(have) ? 2 : have.includes(wanted) ? 1 : 0;

@@ -8,6 +8,7 @@ import { classifyClaudeError, unreachableMessage, type ClaudeProblem } from "./e
 import { parseCommand } from "./commands.ts";
 import type { HistoryStore } from "./history.ts";
 import { AllowRules, describeRule, ruleFor, type AllowRule } from "./rules.ts";
+import type { Settings, VOICES } from "./settings.ts";
 import type { CaptureOptions, Listener } from "./listener.ts";
 import { SentenceSplitter } from "./sentences.ts";
 import type { SessionManager } from "./sessions.ts";
@@ -44,6 +45,12 @@ export type UiEvent =
       failed: boolean; error?: string }
   // Claude can't be reached (the red Error state): what to say, and the command that fixes it.
   | { type: "error"; reason: Extract<ClaudeProblem, { kind: "unreachable" }>["reason"]; text: string; command: string }
+  // Settings and first-run setup.
+  | { type: "settings"; values: Settings; locked: Array<keyof Settings>; voices: typeof VOICES;
+      projects: Array<{ path: string; kind: string }>; permissionMode: string; dataDir: string }
+  | { type: "claude_status"; installed: boolean; version?: string; loggedIn: boolean; plan?: string }
+  | { type: "models"; whisper: boolean; kokoro: { loaded: number; total: number; done: boolean; failed: boolean } }
+  | { type: "mic_status"; ok: boolean }
   // Saved "Always allow" rules, for Settings.
   | { type: "rules"; rules: Array<{ label: string; folder: string }> }
   // The History window: a search's results, and one conversation opened.
@@ -68,6 +75,12 @@ export type UiCommand =
   | { type: "approve"; id: number; allow: boolean; always?: boolean }
   | { type: "rule_remove"; index: number }
   | { type: "retry" } // Try again, from the Error state
+  | { type: "ptt"; down: boolean } // push to talk: F5 pressed or released
+  | { type: "settings_set"; values: Partial<Settings> }
+  | { type: "voice_sample"; voice: string }
+  | { type: "claude_check" }
+  | { type: "mic_check" }
+  | { type: "history_clear" }
   | { type: "report_seen"; taskId: number }
   // The Agents window: start, steer and stop background tasks without speaking.
   | { type: "task_new"; text: string; project?: string }
@@ -82,6 +95,8 @@ const WAKE_CAPTURE: CaptureOptions = { preRollMs: 1500, noSpeechTimeoutMs: 5000 
 const CLICK_CAPTURE: CaptureOptions = { preRollMs: 200, noSpeechTimeoutMs: 6000 };
 const FOLLOW_UP_CAPTURE: CaptureOptions = { preRollMs: 300, noSpeechTimeoutMs: 8000 };
 const ANSWER_CAPTURE: CaptureOptions = { preRollMs: 300, noSpeechTimeoutMs: 10_000 };
+// Push to talk: listens for as long as the key is held.
+const HELD_CAPTURE: CaptureOptions = { preRollMs: 150, noSpeechTimeoutMs: 60_000, held: true };
 // Talking over Jarvis: the words that triggered it are already in the pre-roll.
 const BARGE_IN_CAPTURE: CaptureOptions = { preRollMs: 800, noSpeechTimeoutMs: 3000, speechStarted: true };
 // An utterance made only of these (with at least one STOP_WORD) means "stop talking",
@@ -175,6 +190,22 @@ export class Jarvis {
       return;
     }
     this.listen(byVoice ? WAKE_CAPTURE : CLICK_CAPTURE, false);
+  }
+
+  // Push to talk (hold F5): listen while the key is down; releasing it ends what you said.
+  pushToTalk(down: boolean): void {
+    if (!down) {
+      if (this.state === "listening" || this.state === "asking") this.deps.listener.finishCapture();
+      return;
+    }
+    if (this.asking) {
+      this.listen(HELD_CAPTURE, false, "asking");
+      return;
+    }
+    this.holdReply();
+    this.gen++;
+    this.sound("wake");
+    this.listen(HELD_CAPTURE, false);
   }
 
   // Finished background work is told first on the next wake: "Quick update first: …".
@@ -283,7 +314,8 @@ export class Jarvis {
         if (detached) return this.say("Okay, I'll keep working on that and let you know when it's done.", gen);
         if (sessions.claude?.busy) {
           this.resolveHold();
-          return this.say("I can only run three things at once, so I've stopped that one.", gen);
+          const most = ["no", "one", "two", "three", "four"][sessions.maxBackground] ?? String(sessions.maxBackground);
+          return this.say(`I can only run ${most} ${sessions.maxBackground === 1 ? "thing" : "things"} at once, so I've stopped that one.`, gen);
         }
         // Nothing was running: "keep going" is a normal request ("keep going with the story").
       }

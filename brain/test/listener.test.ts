@@ -118,3 +118,21 @@ test("a capture that starts mid-speech ends on the next silence", async () => {
   await listener.feed(ms(800));
   assert.deepEqual(events, ["utterance"]);
 });
+
+test("push to talk: a held capture ignores pauses and ends when the key is released", async () => {
+  const { listener, events } = setup();
+  listener.startCapture({ preRollMs: 0, noSpeechTimeoutMs: 60_000, held: true });
+  await listener.feed(ms(400, 100));
+  await listener.feed(ms(1500)); // a long pause: still listening
+  await listener.feed(ms(400, 100));
+  assert.deepEqual(events, ["speech"]);
+  listener.finishCapture();
+  await listener.feed(ms(32));
+  assert.deepEqual(events, ["speech", "utterance"]);
+
+  listener.startCapture({ preRollMs: 0, noSpeechTimeoutMs: 60_000, held: true });
+  await listener.feed(ms(500));
+  listener.finishCapture();
+  await listener.feed(ms(32));
+  assert.deepEqual(events.at(-1), "no-speech", "released without saying anything");
+});

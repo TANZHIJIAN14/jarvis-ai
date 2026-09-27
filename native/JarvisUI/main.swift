@@ -3,8 +3,8 @@
 // streams state over a local WebSocket (UiEvent / UiCommand in brain/src/jarvis.ts).
 //
 // Build: npm run build:native (in brain/)
-// Run:   bin/JarvisUI --port 8765 --token <token>   (the brain launches it; --open-agents / --open-history
-//        open those windows, for development)
+// Run:   bin/JarvisUI --port 8765 --token <token>   (the brain launches it; --open-agents, --open-history,
+//        --open-settings and --onboarding open those windows, for development)
 
 import AppKit
 import Combine
@@ -63,6 +63,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   var brain: BrainConnection!
   var agents: AgentsWindowController!
   var history: HistoryWindowController!
+  var settings: SettingsWindowController!
+  var onboarding: OnboardingWindowController!
+  var pushToTalk: PushToTalkKey!
+  var onboardingShown = false
   var panel: NSPanel!
   var statusItem: NSStatusItem!
   var hideTimer: Timer?
@@ -71,6 +75,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   func applicationDidFinishLaunching(_ notification: Notification) {
     brain = BrainConnection(port: argument("--port") ?? "8765", token: argument("--token") ?? "", model: model)
     agents = AgentsWindowController(model: model) { [weak self] command in self?.brain.send(command) }
+    settings = SettingsWindowController(model: model) { [weak self] command in self?.brain.send(command) }
+    onboarding = OnboardingWindowController(model: model) { [weak self] command in self?.brain.send(command) }
+    pushToTalk = PushToTalkKey { [weak self] down in self?.brain.send(["type": "ptt", "down": down]) }
+    pushToTalk.register()
     history = HistoryWindowController(model: model, send: { [weak self] command in self?.brain.send(command) },
                                       openAgents: { [weak self] id in self?.agents.show(selecting: id) })
     setUpStatusItem()
@@ -83,6 +91,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     brain.connect()
     if CommandLine.arguments.contains("--open-agents") { agents.show() } // for development
     if CommandLine.arguments.contains("--open-history") { history.show() }
+    if CommandLine.arguments.contains("--open-settings") { settings.show() }
+    if CommandLine.arguments.contains("--onboarding") { onboardingShown = true; onboarding.show() }
+    // First run: setup opens by itself until it's been finished once.
+    model.$settingsLoaded.receive(on: RunLoop.main).sink { [weak self] loaded in
+      guard let self, loaded, !self.onboardingShown, !self.model.setting("onboarded", true) else { return }
+      self.onboardingShown = true
+      self.onboarding.show()
+    }.store(in: &observers)
   }
 
   private func setUpStatusItem() {
@@ -115,6 +131,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let historyItem = NSMenuItem(title: "History", action: #selector(openHistory), keyEquivalent: "y")
     historyItem.target = self
     menu.addItem(historyItem)
+    menu.addItem(.separator())
+    let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+    settingsItem.target = self
+    menu.addItem(settingsItem)
     menu.addItem(.separator())
     menu.addItem(withTitle: "Quit Jarvis", action: #selector(quit), keyEquivalent: "q").target = self
     statusItem.menu = menu
@@ -184,6 +204,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   @objc private func talk() { brain.send(["type": "activate"]) }
   @objc func openAgents() { agents.show() }
   @objc func openHistory() { history.show() }
+  @objc func openSettings() { settings.show() }
   @objc private func stop() { brain.send(["type": "stop"]) }
   @objc private func quit() {
     brain.send(["type": "quit"])

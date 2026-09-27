@@ -178,6 +178,11 @@ export class HistoryStore {
       .slice(0, limit);
   }
 
+  // Settings → Privacy → Clear history.
+  clear(): void {
+    this.db.exec("DELETE FROM turns; DELETE FROM sessions;");
+  }
+
   close(): void {
     this.db.close();
   }

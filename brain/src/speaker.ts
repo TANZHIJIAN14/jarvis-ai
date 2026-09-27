@@ -39,9 +39,10 @@ export class Speaker {
     this.ensureRunning();
   }
 
-  say(sentence: string): void {
+  // `using`: a different voice for this sentence (Settings' Sample buttons).
+  say(sentence: string, using?: Synthesize): void {
     const text = sentence.replace(/\s+/g, " ");
-    const synthesize = this.synthesize;
+    const synthesize = using ?? this.synthesize;
     if (!synthesize) {
       this.send(`say ${text}`);
       return;

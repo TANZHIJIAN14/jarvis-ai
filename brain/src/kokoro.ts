@@ -26,11 +26,15 @@ export class KokoroVoice {
   }
 
   // First use downloads the model (~310 MB) into cacheDir.
-  static load(opts: { voice: string; speed: number; cacheDir: string }): Promise<KokoroVoice> {
+  // onProgress: bytes downloaded so far, while the model downloads.
+  static load(opts: { voice: string; speed: number; cacheDir: string },
+              onProgress?: (loaded: number, total: number) => void): Promise<KokoroVoice> {
     const worker = new Worker(new URL("./kokoro-worker.ts", import.meta.url), { workerData: opts });
     return new Promise((resolve, reject) => {
-      const onMessage = (message: { ready?: boolean; loadError?: string }) => {
-        if (message.ready) {
+      const onMessage = (message: { ready?: boolean; loadError?: string; progress?: { loaded: number; total: number } }) => {
+        if (message.progress) {
+          onProgress?.(message.progress.loaded, message.progress.total);
+        } else if (message.ready) {
           worker.off("message", onMessage);
           resolve(new KokoroVoice(worker));
         } else if (message.loadError) {
@@ -43,12 +47,13 @@ export class KokoroVoice {
     });
   }
 
-  // Synthesizes one sentence to a WAV file and returns its path.
-  synthesize(text: string): Promise<string> {
+  // Synthesizes one sentence to a WAV file and returns its path. Voice and speed default to
+  // the ones it was loaded with.
+  synthesize(text: string, opts: { voice?: string; speed?: number } = {}): Promise<string> {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
-      this.worker.postMessage({ id, text });
+      this.worker.postMessage({ id, text, ...opts });
     });
   }
 

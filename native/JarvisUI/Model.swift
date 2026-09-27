@@ -97,6 +97,25 @@ struct Report: Identifiable {
   let failed: Bool
 }
 
+struct VoiceOption: Identifiable {
+  let id: String
+  let name: String
+  let note: String
+}
+
+struct KnownProject: Identifiable {
+  var id: String { path }
+  let path: String
+  let kind: String // default, added, recent
+}
+
+struct ClaudeStatus {
+  let installed: Bool
+  let version: String?
+  let loggedIn: Bool
+  let plan: String?
+}
+
 // The red Error state: Claude can't be reached.
 struct ClaudeError {
   let text: String
@@ -120,6 +139,20 @@ final class JarvisModel: ObservableObject {
   @Published var taskDiffs: [Int: String] = [:]
   @Published var rules: [AllowRuleItem] = []
   @Published var error: ClaudeError?
+  // Settings (SettingsStore in brain/src/settings.ts) and first-run setup.
+  @Published var settings: [String: Any] = [:]
+  @Published var lockedSettings: Set<String> = []
+  @Published var voices: [VoiceOption] = []
+  @Published var knownProjects: [KnownProject] = []
+  @Published var permissionMode = "manual"
+  @Published var dataDir = ""
+  @Published var claude: ClaudeStatus?
+  @Published var whisperReady = false
+  @Published var kokoro = (loaded: 0.0, total: 0.0, done: false, failed: false)
+  @Published var micOK = false
+  @Published var settingsLoaded = false
+
+  func setting<T>(_ key: String, _ fallback: T) -> T { settings[key] as? T ?? fallback }
   @Published var reports: [Report] = [] // finished background work to show
   @Published var connected = false
   @Published var history: [HistoryItem] = [] // the History window's current search results
@@ -235,6 +268,27 @@ final class JarvisModel: ObservableObject {
       rules = (event["rules"] as? [[String: Any]] ?? []).enumerated().map { index, r in
         AllowRuleItem(id: index, label: r["label"] as? String ?? "", folder: r["folder"] as? String ?? "")
       }
+    case "settings":
+      settings = event["values"] as? [String: Any] ?? [:]
+      lockedSettings = Set(event["locked"] as? [String] ?? [])
+      voices = (event["voices"] as? [[String: Any]] ?? []).map {
+        VoiceOption(id: $0["id"] as? String ?? "", name: $0["name"] as? String ?? "", note: $0["note"] as? String ?? "")
+      }
+      knownProjects = (event["projects"] as? [[String: Any]] ?? []).map {
+        KnownProject(path: $0["path"] as? String ?? "", kind: $0["kind"] as? String ?? "")
+      }
+      permissionMode = event["permissionMode"] as? String ?? "manual"
+      dataDir = event["dataDir"] as? String ?? ""
+      settingsLoaded = true
+    case "claude_status":
+      claude = ClaudeStatus(installed: event["installed"] as? Bool ?? false, version: event["version"] as? String,
+                            loggedIn: event["loggedIn"] as? Bool ?? false, plan: event["plan"] as? String)
+    case "models":
+      whisperReady = event["whisper"] as? Bool ?? false
+      let k = event["kokoro"] as? [String: Any] ?? [:]
+      kokoro = ((k["loaded"] as? Double) ?? 0, (k["total"] as? Double) ?? 0, k["done"] as? Bool ?? false, k["failed"] as? Bool ?? false)
+    case "mic_status":
+      micOK = event["ok"] as? Bool ?? false
     case "history_results":
       historyProjects = event["projects"] as? [String] ?? []
       history = (event["sessions"] as? [[String: Any]] ?? []).map { s in
