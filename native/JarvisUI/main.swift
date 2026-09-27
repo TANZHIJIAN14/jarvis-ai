@@ -78,7 +78,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     settings = SettingsWindowController(model: model) { [weak self] command in self?.brain.send(command) }
     onboarding = OnboardingWindowController(model: model) { [weak self] command in self?.brain.send(command) }
     pushToTalk = PushToTalkKey { [weak self] down in self?.brain.send(["type": "ptt", "down": down]) }
-    pushToTalk.register()
+    model.$settings.receive(on: RunLoop.main).sink { [weak self] _ in
+      guard let self, self.model.settingsLoaded else { return }
+      self.pushToTalk.setEnabled(self.model.setting("pushToTalk", true))
+    }.store(in: &observers)
     history = HistoryWindowController(model: model, send: { [weak self] command in self?.brain.send(command) },
                                       openAgents: { [weak self] id in self?.agents.show(selecting: id) })
     setUpStatusItem()

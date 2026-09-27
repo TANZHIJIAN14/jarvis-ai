@@ -13,18 +13,29 @@ final class PushToTalkKey {
     self.onChange = onChange
   }
 
-  func register() {
+  // Claims F5 only while push to talk is on in Settings.
+  func setEnabled(_ on: Bool) {
+    if on && hotKey == nil { register() }
+    if !on, let key = hotKey {
+      UnregisterEventHotKey(key)
+      hotKey = nil
+    }
+  }
+
+  private func register() {
     var types = [
       EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed)),
       EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyReleased)),
     ]
     let this = Unmanaged.passUnretained(self).toOpaque()
-    InstallEventHandler(GetApplicationEventTarget(), { _, event, context in
-      guard let event, let context else { return noErr }
-      let key = Unmanaged<PushToTalkKey>.fromOpaque(context).takeUnretainedValue()
-      key.changed(GetEventKind(event) == UInt32(kEventHotKeyPressed))
-      return noErr
-    }, types.count, &types, this, &handler)
+    if handler == nil {
+      InstallEventHandler(GetApplicationEventTarget(), { _, event, context in
+        guard let event, let context else { return noErr }
+        let key = Unmanaged<PushToTalkKey>.fromOpaque(context).takeUnretainedValue()
+        key.changed(GetEventKind(event) == UInt32(kEventHotKeyPressed))
+        return noErr
+      }, types.count, &types, this, &handler)
+    }
     let id = EventHotKeyID(signature: OSType(0x4A525653), id: 1) // "JRVS"
     RegisterEventHotKey(UInt32(kVK_F5), 0, id, GetApplicationEventTarget(), 0, &hotKey)
   }

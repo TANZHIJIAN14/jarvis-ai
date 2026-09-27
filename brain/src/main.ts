@@ -48,7 +48,7 @@ const settings = new SettingsStore(join(config.dataDir, "settings.json"), {
   openAtLogin: isOpenAtLogin(),
   keepRecordings: false,
   projects: [],
-  onboarded: false,
+  onboarded: existsSync(join(config.dataDir, "jarvis.sqlite")), // set up before Settings existed
 });
 // Events from before the UI server starts (model download progress) are dropped.
 let uiServer: UiServer | undefined;
