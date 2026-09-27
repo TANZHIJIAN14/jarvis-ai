@@ -140,6 +140,7 @@ const ui = new UiServer({
     else if (command.type === "stop") jarvis.stop();
     else if (command.type === "quit") shutdown();
     else if (command.type === "approve") jarvis.answerFromUi(command.id, command.allow);
+    else if (command.type === "report_seen") jarvis.reportSeen(command.taskId);
   },
 });
 await ui.start();
@@ -246,7 +247,10 @@ function logEvent(event: UiEvent): void {
       log(dim(`  (${event.text})`));
       break;
     case "approval":
-      log(`${cyan("Jarvis asks:")} ${event.question}${event.detail ? dim(`  [${event.detail}]`) : ""}`);
+      log(`${cyan("Jarvis asks:")} ${event.question}${event.detail ? dim(`  [${event.detail}]`) : ""}${event.destructive ? dim(" (needs a click)") : ""}`);
+      break;
+    case "task":
+      log(dim(`  [task ${event.id}: ${event.title} · ${event.status}${event.activity ? ` · ${event.activity}` : ""}]`));
       break;
     case "approval_done":
       log(dim(`  (${event.allowed ? "approved" : "not approved"})`));

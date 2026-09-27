@@ -73,9 +73,9 @@ function setup(transcripts: string[], opts: { bargeIn?: boolean; history?: Histo
     defaultCwd: "/tmp/jarvis-workspace",
     projectsDir,
   });
-  const notes: string[] = [];
+  const sounds: string[] = [];
   const jarvis = new Jarvis({
-    notify: (_title, body) => notes.push(body),
+    sound: (name) => sounds.push(name),
     listener: {
       startCapture: (o: CaptureOptions) => captures.push(o),
       stopCapture() {},
@@ -86,11 +86,10 @@ function setup(transcripts: string[], opts: { bargeIn?: boolean; history?: Histo
     sessions,
     history,
     emit: (e) => events.push(e),
-    chime: () => {},
     bargeIn: opts.bargeIn,
   });
   const states = () => events.filter((e) => e.type === "state").map((e) => (e as { state: string }).state);
-  return { jarvis, events, captures, spoken, claude, states, watching, history, claudeStarts, projectsDir, notes };
+  return { jarvis, events, captures, spoken, claude, states, watching, history, claudeStarts, projectsDir, sounds };
 }
 
 test("a full turn: wake, transcribe, reply by voice, then a follow-up window", async () => {
@@ -265,9 +264,9 @@ test("'what did we decide about …' hands Claude the relevant past turns", asyn
     "history keeps what the user said, not the notes");
 });
 
-test("'keep going in the background' leaves Claude working and reports back when done", async () => {
-  const ctx = setup(["Jarvis, refactor the auth module", "keep going in the background", "what time is it?"]);
-  const { jarvis, claude, spoken, notes, claudeStarts } = ctx;
+test("'keep going in the background' leaves Claude working; the result waits for the next wake", async () => {
+  const ctx = setup(["Jarvis, refactor the auth module", "keep going in the background", "what time is it?", "Hey Jarvis"]);
+  const { jarvis, claude, spoken, events, sounds } = ctx;
   jarvis.activate(true);
   const first = jarvis.onUtterance(new Int16Array(16));
   await tick();
@@ -277,23 +276,44 @@ test("'keep going in the background' leaves Claude working and reports back when
   await jarvis.onUtterance(new Int16Array(16));
   assert.equal(claude.interrupts(), 0, "the task was not killed");
   assert.equal(spoken.at(-1), "Okay, I'll keep working on that and let you know when it's done.");
+  const running = events.filter((e) => e.type === "task").at(-1) as Extract<UiEvent, { type: "task" }>;
+  assert.equal(running.status, "running");
+  assert.equal(running.id, 1);
+
+  // Its tool use shows up as the task's activity.
+  claude.turns[0].handlers.onTool!("Read", { file_path: "/x/src/auth.ts" });
+  assert.equal((events.filter((e) => e.type === "task").at(-1) as { activity: string }).activity, "Reading auth.ts");
 
   // The next request goes to a fresh session while the first keeps running.
   jarvis.activate(true);
   const third = jarvis.onUtterance(new Int16Array(16));
   await tick();
-  assert.equal(claudeStarts.length, 2, "a new Claude session for the next request");
+  assert.equal(ctx.claudeStarts.length, 2, "a new Claude session for the next request");
   claude.turns[1].handlers.onText!("It's three.");
   claude.turns[1].finish({ text: "It's three.", sessionId: "c2" });
   await third;
 
-  jarvis.stop(); // quiet moment
+  jarvis.stop();
+  const spokenBefore = spoken.length;
   claude.turns[0].handlers.onText!("Done: I split it into three files.");
   claude.turns[0].finish({ text: "Done", sessionId: "c1" });
   await first;
   await tick();
-  assert.match(notes[0], /^Finished your earlier request\. Starting on the auth module\./);
-  assert.equal(spoken.at(-1), notes[0], "announced out loud once Jarvis was idle");
+  assert.equal(spoken.length, spokenBefore, "finished work waits quietly");
+  assert.ok(sounds.includes("done"), "a chime marks it");
+  const done = events.filter((e) => e.type === "task").at(-1) as Extract<UiEvent, { type: "task" }>;
+  assert.equal(done.status, "done");
+  assert.equal(done.reported, false);
+  assert.ok(events.some((e) => e.type === "task_report" && e.taskId === 1));
+
+  // Reported first on the next "Hey Jarvis", then Jarvis listens for the question.
+  jarvis.activate(true);
+  await tick();
+  await tick();
+  assert.match(spoken.at(-2)!, /^Quick update first: Finished your earlier request\. Starting on the auth module\./);
+  assert.equal(spoken.at(-1), "What did you want to ask?");
+  assert.equal(jarvis.state, "listening");
+  assert.equal((events.filter((e) => e.type === "task").at(-1) as { reported: boolean }).reported, true);
   assert.equal(ctx.history.transcript(1)[0].user, "refactor the auth module", "recorded in its own session");
 });
 
@@ -364,6 +384,33 @@ test("an approval can be answered on the orb", async () => {
   const decision = ctx.jarvis.requestApproval({ sessionId: 1, toolName: "Edit", input: { file_path: "/x/README.md" } });
   await tick();
   const asked = ctx.events.find((e) => e.type === "approval") as { id: number };
+  ctx.jarvis.answerFromUi(asked.id, true);
+  assert.equal((await decision).behavior, "allow");
+});
+
+test("tool use in the current turn carries a 'what Jarvis is doing' line", async () => {
+  const ctx = setup(["Jarvis, find the flaky test"]);
+  ctx.jarvis.activate(true);
+  const reply = ctx.jarvis.onUtterance(new Int16Array(16));
+  await tick();
+  ctx.claude.turns[0].handlers.onTool!("Grep", { pattern: "flaky" });
+  const tool = ctx.events.find((e) => e.type === "tool") as Extract<UiEvent, { type: "tool" }>;
+  assert.equal(tool.activity, "Searching for “flaky”");
+  ctx.claude.turns[0].finish({});
+  await reply;
+});
+
+test("a destructive command can't be approved by voice: it needs a click", async () => {
+  const ctx = setup(["yes", "yes"]);
+  const decision = ctx.jarvis.requestApproval({ sessionId: 1, toolName: "Bash",
+    input: { command: "git push origin main", description: "Push the branch to GitHub" } });
+  await tick();
+  const asked = ctx.events.find((e) => e.type === "approval") as Extract<UiEvent, { type: "approval" }>;
+  assert.equal(asked.destructive, true);
+  await ctx.jarvis.onUtterance(new Int16Array(16)); // "yes"
+  await tick();
+  assert.equal(ctx.spoken.at(-1), "That one can't be undone, so please click Allow if you're sure.");
+  assert.equal(ctx.jarvis.state, "asking", "still waiting");
   ctx.jarvis.answerFromUi(asked.id, true);
   assert.equal((await decision).behavior, "allow");
 });

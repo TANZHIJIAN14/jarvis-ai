@@ -10,7 +10,7 @@
     "start": "node --experimental-strip-types --no-warnings=ExperimentalWarning src/main.ts",
     "prespike": "test -x ../native/bin/mic-capture -a -x ../native/bin/speak -a -x ../native/bin/JarvisUI || npm run build:native",
     "spike": "node --experimental-strip-types --no-warnings=ExperimentalWarning src/spike.ts",
-    "build:native": "mkdir -p ../native/bin && cd ../native && for f in mic-capture speak JarvisUI; do xcrun swiftc -O -swift-version 5 $f.swift -o bin/$f || exit 1; done",
+    "build:native": "mkdir -p ../native/bin && cd ../native && for f in mic-capture speak; do xcrun swiftc -O -swift-version 5 $f.swift -o bin/$f || exit 1; done && xcrun swiftc -O -swift-version 5 JarvisUI/*.swift -o bin/JarvisUI",
     "test": "node --experimental-strip-types --no-warnings=ExperimentalWarning --test \"test/**/*.test.ts\"",
     "typecheck": "tsc"
   },
