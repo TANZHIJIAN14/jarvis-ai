@@ -130,6 +130,8 @@ struct AgentsView: View {
         approval: model.approval?.taskId == id ? model.approval : nil,
         steps: model.taskSteps[id] ?? [],
         result: model.taskResults[id],
+        files: model.taskFiles[id] ?? [],
+        diff: model.taskDiffs[id] ?? "",
         send: send,
         copied: { text in
           withAnimation { toast = text }
@@ -208,6 +210,8 @@ private struct TaskDetail: View {
   let approval: Approval?
   let steps: [TaskStep]
   let result: String?
+  let files: [FileChange]
+  let diff: String
   var send: ([String: Any]) -> Void
   var copied: (String) -> Void
   @State private var note = ""
@@ -233,6 +237,15 @@ private struct TaskDetail: View {
               Text("Result").font(.system(size: 13, weight: .semibold))
               MarkdownView(text: result, fontSize: 14)
             }
+          }
+
+          if !files.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+              FilesChanged(files: files)
+              if !diff.isEmpty { DiffView(diff: diff) }
+            }
+          } else if task.isFinished && result != nil {
+            Text("No files changed.").font(.system(size: 13)).foregroundStyle(Theme.secondary)
           }
 
           VStack(alignment: .leading, spacing: 8) {
@@ -304,6 +317,14 @@ private struct TaskDetail: View {
       HStack(spacing: 8) {
         Button("Allow") { send(["type": "approve", "id": approval.id, "allow": true]) }.buttonStyle(PrimaryButton())
         Button("Deny") { send(["type": "approve", "id": approval.id, "allow": false]) }.buttonStyle(SecondaryButton())
+        if let always = approval.always {
+          Button("Always allow") { send(["type": "approve", "id": approval.id, "allow": true, "always": true]) }
+            .buttonStyle(SecondaryButton())
+            .help(always)
+        }
+      }
+      if let always = approval.always {
+        Text("Always allow: \(always)").font(.system(size: 12)).foregroundStyle(Theme.secondary)
       }
     }
     .padding(14)

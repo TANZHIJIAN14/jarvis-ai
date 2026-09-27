@@ -521,3 +521,46 @@ test("History window: search lists past conversations, and Continue makes the ne
   jarvis.historyQuery("");
   assert.equal((events.at(-1) as Extract<UiEvent, { type: "history_results" }>).sessions[0].current, true);
 });
+
+test("'Always allow' saves a rule for that folder: the next matching request isn't asked", async () => {
+  const ctx = setup([]);
+  ctx.jarvis.prepare(); // session 1 in /tmp/jarvis-workspace
+  const first = ctx.jarvis.requestApproval({ sessionId: 1, toolName: "Bash", input: { command: "npm test" } });
+  await tick();
+  const asked = ctx.events.find((e) => e.type === "approval") as Extract<UiEvent, { type: "approval" }>;
+  assert.equal(asked.always, "Run “npm test” in jarvis-workspace");
+  ctx.jarvis.answerFromUi(asked.id, true, true);
+  assert.equal((await first).behavior, "allow");
+  assert.deepEqual((ctx.events.findLast((e) => e.type === "rules") as Extract<UiEvent, { type: "rules" }>).rules,
+    [{ label: "Run “npm test”", folder: "/tmp/jarvis-workspace" }]);
+
+  const asks = ctx.events.filter((e) => e.type === "approval").length;
+  assert.equal((await ctx.jarvis.requestApproval({ sessionId: 1, toolName: "Bash", input: { command: "npm test -- x" } })).behavior, "allow");
+  assert.equal(ctx.events.filter((e) => e.type === "approval").length, asks, "not asked again");
+
+  const push = ctx.jarvis.requestApproval({ sessionId: 1, toolName: "Bash", input: { command: "git push" } });
+  await tick();
+  assert.equal((ctx.events.at(-1) as Extract<UiEvent, { type: "approval" }>).always, undefined, "never offered for destructive commands");
+  ctx.jarvis.stop();
+  assert.equal((await push).behavior, "deny");
+});
+
+test("a task's report lists the files it changed, with the diff", async () => {
+  const { mkdtempSync: mk, writeFileSync } = await import("node:fs");
+  const ctx = setup([]);
+  const dir = mk(join(tmpdir(), "jarvis-task-"));
+  writeFileSync(join(dir, "a.txt"), "old\n");
+  const id = ctx.jarvis.startTask("Update a.txt");
+  await tick();
+  ctx.claude.turns[0].handlers.onTool!("Edit", { file_path: join(dir, "a.txt"), old_string: "old", new_string: "new" });
+  writeFileSync(join(dir, "a.txt"), "new\n");
+  ctx.claude.turns[0].finish({ text: "Updated it." });
+  await tick();
+  await tick();
+  const report = ctx.events.find((e) => e.type === "task_report" && e.taskId === id) as Extract<UiEvent, { type: "task_report" }>;
+  assert.deepEqual(report.files, [{ path: join(dir, "a.txt"), added: 1, removed: 1 }]);
+  assert.match(report.diff, /-old\n\+new/);
+  ctx.jarvis.activate(true);
+  await tick();
+  assert.match(ctx.spoken.join(" "), /1 file changed\./);
+});

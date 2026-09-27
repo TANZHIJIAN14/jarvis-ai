@@ -18,7 +18,7 @@ func argument(_ name: String) -> String? {
 struct JarvisView: View {
   @ObservedObject var model: JarvisModel
   var onOrbTap: () -> Void
-  var onApprove: (Int, Bool) -> Void
+  var onApprove: (Int, Bool, Bool) -> Void
   var onReportSeen: (Int) -> Void
   var onOpenAgents: (Int?) -> Void
 
@@ -143,7 +143,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     panel.contentView = NSHostingView(rootView: JarvisView(
       model: model,
       onOrbTap: { [weak self] in self?.orbTapped() },
-      onApprove: { [weak self] id, allow in self?.brain.send(["type": "approve", "id": id, "allow": allow]) },
+      onApprove: { [weak self] id, allow, always in
+        self?.brain.send(["type": "approve", "id": id, "allow": allow, "always": always])
+      },
       onReportSeen: { [weak self] id in
         self?.model.dismissReport(id)
         self?.brain.send(["type": "report_seen", "taskId": id])

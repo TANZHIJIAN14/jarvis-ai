@@ -7,7 +7,7 @@ import SwiftUI
 
 struct Panel: View {
   @ObservedObject var model: JarvisModel
-  var onApprove: (Int, Bool) -> Void
+  var onApprove: (Int, Bool, Bool) -> Void
   var onReportSeen: (Int) -> Void
   var onOpenAgents: (Int?) -> Void
 
@@ -122,7 +122,7 @@ private struct ReplyText: View {
 
 private struct ApprovalCard: View {
   let approval: Approval
-  var onApprove: (Int, Bool) -> Void
+  var onApprove: (Int, Bool, Bool) -> Void
 
   var body: some View {
     VStack(alignment: .leading, spacing: 10) {
@@ -139,12 +139,18 @@ private struct ApprovalCard: View {
             .background(Theme.text.opacity(0.05), in: RoundedRectangle(cornerRadius: 7))
         }
         HStack(spacing: 8) {
-          Button("Allow") { onApprove(approval.id, true) }.buttonStyle(PrimaryButton())
-          Button("Deny") { onApprove(approval.id, false) }.buttonStyle(SecondaryButton())
+          Button("Allow") { onApprove(approval.id, true, false) }.buttonStyle(PrimaryButton())
+          Button("Deny") { onApprove(approval.id, false, false) }.buttonStyle(SecondaryButton())
           Spacer()
           Text(approval.destructive ? "Can't be undone: needs a click" : "or just say yes or no")
             .font(.system(size: 12))
             .foregroundStyle(approval.destructive ? Theme.needsYouText : Theme.secondary)
+        }
+        if let always = approval.always {
+          Button("Always allow: \(always)") { onApprove(approval.id, true, true) }
+            .buttonStyle(.link)
+            .font(.system(size: 12))
+            .lineLimit(1)
         }
       }
       .padding(12)
@@ -172,6 +178,9 @@ private struct ReportCard: View {
         .font(.system(size: 13))
         .lineLimit(6)
         .textSelection(.enabled)
+      if !report.files.isEmpty {
+        FilesChanged(files: report.files, limit: 3)
+      }
     }
     .padding(12)
     .background(Theme.card, in: RoundedRectangle(cornerRadius: 10))
@@ -230,6 +239,68 @@ private struct Footer: View {
     .foregroundStyle(Theme.secondary)
     .padding(.top, 10)
     .overlay(alignment: .top) { Rectangle().fill(Theme.panelBorder).frame(height: 1) }
+  }
+}
+
+// "2 files changed": each file with its +added −removed, in SF Mono.
+struct FilesChanged: View {
+  let files: [FileChange]
+  var limit = Int.max
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 3) {
+      Text(files.count == 1 ? "1 file changed" : "\(files.count) files changed")
+        .font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.secondary)
+      ForEach(files.prefix(limit)) { file in
+        HStack(spacing: 8) {
+          Text(file.path).font(.system(size: 12, design: .monospaced)).lineLimit(1).truncationMode(.head)
+          Spacer(minLength: 4)
+          Text("+\(file.added)").font(.system(size: 12, design: .monospaced)).foregroundStyle(Theme.done)
+          Text("−\(file.removed)").font(.system(size: 12, design: .monospaced)).foregroundStyle(Theme.failed)
+        }
+      }
+      if files.count > limit {
+        Text("and \(files.count - limit) more").font(.system(size: 12)).foregroundStyle(Theme.secondary)
+      }
+    }
+  }
+}
+
+// A unified diff with added lines in green and removed lines in red.
+struct DiffView: View {
+  let diff: String
+
+  var body: some View {
+    let lines = diff.components(separatedBy: "\n")
+    ScrollView(.horizontal, showsIndicators: false) {
+      LazyVStack(alignment: .leading, spacing: 0) {
+        ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+          Text(line.isEmpty ? " " : line)
+            .font(.system(size: 12, design: .monospaced))
+            .foregroundStyle(color(line))
+            .padding(.horizontal, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(background(line))
+        }
+      }
+      .padding(.vertical, 8)
+    }
+    .textSelection(.enabled)
+    .background(Theme.text.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+  }
+
+  private func color(_ line: String) -> Color {
+    if line.hasPrefix("+++") || line.hasPrefix("---") { return Theme.text }
+    if line.hasPrefix("+") { return Theme.done }
+    if line.hasPrefix("-") { return Theme.failed }
+    if line.hasPrefix("@@") { return Theme.running }
+    return Theme.secondary
+  }
+
+  private func background(_ line: String) -> Color {
+    if line.hasPrefix("+") && !line.hasPrefix("+++") { return Theme.done.opacity(0.08) }
+    if line.hasPrefix("-") && !line.hasPrefix("---") { return Theme.failed.opacity(0.08) }
+    return .clear
   }
 }
 

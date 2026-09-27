@@ -20,6 +20,7 @@ import { toWav } from "./recorder.ts";
 import { SessionManager } from "./sessions.ts";
 import { Speaker } from "./speaker.ts";
 import { Transcriber } from "./transcriber.ts";
+import { AllowRules } from "./rules.ts";
 import { UiServer } from "./ui-server.ts";
 import { Vad } from "./vad.ts";
 import { WakeWord } from "./wake-word.ts";
@@ -125,6 +126,7 @@ const jarvis = new Jarvis({
     ui.broadcast(event);
   },
   bargeIn: config.echoCancel, // switched off below if the mic falls back to plain capture
+  rules: new AllowRules(join(config.dataDir, "always-allow.json")),
 });
 
 const token = randomBytes(16).toString("hex");
@@ -134,12 +136,14 @@ const ui = new UiServer({
   snapshot: (): UiEvent[] => [
     { type: "state", state: jarvis.state, followUp: jarvis.followUp },
     ...(sessions.record ? [sessionEvent(sessions.record)] : []),
+    jarvis.rulesEvent(),
   ],
   onCommand: (command) => {
     if (command.type === "activate") jarvis.activate(false);
     else if (command.type === "stop") jarvis.stop();
     else if (command.type === "quit") shutdown();
-    else if (command.type === "approve") jarvis.answerFromUi(command.id, command.allow);
+    else if (command.type === "approve") jarvis.answerFromUi(command.id, command.allow, command.always);
+    else if (command.type === "rule_remove") jarvis.removeRule(command.index);
     else if (command.type === "report_seen") jarvis.reportSeen(command.taskId);
     else if (command.type === "task_new") jarvis.startTask(command.text, command.project);
     else if (command.type === "task_note") jarvis.noteTask(command.taskId, command.text);

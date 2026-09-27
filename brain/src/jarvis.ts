@@ -3,8 +3,10 @@ import { basename } from "node:path";
 import type { ApprovalDecision, ApprovalRequest } from "./approval-server.ts";
 import { describeActivity } from "./activity.ts";
 import { describeRequest, isDestructive, parseAnswer } from "./approvals.ts";
+import { ChangeTracker, spokenChanges, type FileChange } from "./changes.ts";
 import { parseCommand } from "./commands.ts";
 import type { HistoryStore } from "./history.ts";
+import { AllowRules, describeRule, ruleFor, type AllowRule } from "./rules.ts";
 import type { CaptureOptions, Listener } from "./listener.ts";
 import { SentenceSplitter } from "./sentences.ts";
 import type { SessionManager } from "./sessions.ts";
@@ -28,14 +30,17 @@ export type UiEvent =
   | { type: "reply_done"; error?: string }
   | { type: "notice"; text: string }
   | { type: "session"; id: number; title: string | null; project: string }
-  | { type: "approval"; id: number; question: string; detail: string; destructive: boolean; taskId?: number }
+  // `always`: what "Always allow" would save ("Run “npm test” in jarvis-ai"); absent when not offered.
+  | { type: "approval"; id: number; question: string; detail: string; destructive: boolean; taskId?: number; always?: string }
   | { type: "approval_done"; id: number; allowed: boolean }
   // A background task (its id is its session's id). `reported`: its result has been told to the user.
   | { type: "task"; id: number; title: string; project: string; status: TaskStatus; activity: string;
       startedAt: number; reported: boolean; request: string; origin: "voice" | "window"; cwd: string;
       claudeSessionId: string | null }
   | { type: "task_step"; taskId: number; tool: string; detail: string; at: number }
-  | { type: "task_report"; taskId: number; title: string; summary: string }
+  | { type: "task_report"; taskId: number; title: string; summary: string; files: FileChange[]; diff: string }
+  // Saved "Always allow" rules, for Settings.
+  | { type: "rules"; rules: Array<{ label: string; folder: string }> }
   // The History window: a search's results, and one conversation opened.
   | { type: "history_results"; query: string; project: string | null; projects: string[]; sessions: HistoryItem[] }
   | { type: "history_detail"; id: number; turns: Array<{ at: number; user: string; reply: string; tools: string[] }> };
@@ -55,7 +60,8 @@ export type UiCommand =
   | { type: "activate" }
   | { type: "stop" }
   | { type: "quit" }
-  | { type: "approve"; id: number; allow: boolean }
+  | { type: "approve"; id: number; allow: boolean; always?: boolean }
+  | { type: "rule_remove"; index: number }
   | { type: "report_seen"; taskId: number }
   // The Agents window: start, steer and stop background tasks without speaking.
   | { type: "task_new"; text: string; project?: string }
@@ -101,6 +107,7 @@ export type JarvisDeps = {
   emit: (event: UiEvent) => void;
   // "wake": Jarvis is listening; "done": a background task finished (its report waits for the next wake).
   sound?: (name: "wake" | "done") => void;
+  rules?: AllowRules; // "Always allow" answers; in memory when absent
 
   // Interrupt by talking over Jarvis. Needs echo cancellation, or Jarvis hears itself.
   bargeIn?: boolean;
@@ -113,6 +120,7 @@ type Approval = {
   detail: string;
   destructive: boolean; // needs a click, not a spoken yes
   taskId?: number;
+  rule?: AllowRule; // what "Always allow" saves
   retries: number;
   resolve: (decision: ApprovalDecision) => void;
 };
@@ -138,10 +146,13 @@ export class Jarvis {
   private approvals: Array<Approval> = [];
   private asking: Approval | undefined;
   private nextApprovalId = 1;
+  private rules: AllowRules;
+  private changes = new Map<number, ChangeTracker>(); // per session: files touched, for task reports
 
   constructor(deps: JarvisDeps) {
     this.deps = deps;
     this.bargeIn = deps.bargeIn ?? false;
+    this.rules = deps.rules ?? new AllowRules();
   }
 
   // "Hey Jarvis" or a click on the orb: stop talking and listen.
@@ -229,7 +240,7 @@ export class Jarvis {
       if (verdict === "yes" && this.asking.destructive) {
         return this.askAgain("That one can't be undone, so please click Allow if you're sure.");
       }
-      if (verdict) return this.answer(verdict === "yes");
+      if (verdict) return this.answer(verdict === "yes", undefined, verdict === "yes" && /\balways\b/i.test(text));
       if (this.asking.retries++ === 0) return this.askAgain("Sorry, was that a yes or a no?");
       return this.answer(false, `The user replied "${text}", which wasn't a clear yes.`);
     }
@@ -330,6 +341,8 @@ export class Jarvis {
     const { speaker, emit, sessions } = this.deps;
     const session = sessions.forTurn();
     const sessionId = sessions.record!.id;
+    const changes = new ChangeTracker(sessions.record!.cwd);
+    this.changes.set(sessionId, changes); // carried into a task if this turn moves to the background
     const splitter = new SentenceSplitter();
     let replyText = "";
     const tools: string[] = [];
@@ -349,6 +362,7 @@ export class Jarvis {
       },
       onTool: (name, input) => {
         tools.push(`${name} ${toolDetail(input)}`.trim());
+        changes.onTool(name, input);
         const activity = describeActivity(name, input);
         if (sessions.isBackground(sessionId)) {
           this.taskStep(sessionId, name, input);
@@ -396,10 +410,13 @@ export class Jarvis {
 
   // Called (via the approval server) when Claude needs permission for an edit or a command.
   requestApproval(request: ApprovalRequest): Promise<ApprovalDecision> {
+    const record = this.deps.history.get(request.sessionId);
+    const cwd = record?.cwd ?? this.deps.sessions.defaultCwd;
+    if (this.rules.allows(request, cwd)) return Promise.resolve({ behavior: "allow", updatedInput: request.input });
     return new Promise((resolve) => {
       const { question, detail } = describeRequest(request);
       const background = this.deps.sessions.isBackground(request.sessionId);
-      const title = this.deps.history.get(request.sessionId)?.title;
+      const title = record?.title;
       this.approvals.push({
         id: this.nextApprovalId++,
         request,
@@ -407,6 +424,7 @@ export class Jarvis {
         detail,
         destructive: isDestructive(request),
         taskId: background ? request.sessionId : undefined,
+        rule: ruleFor(request, cwd),
         retries: 0,
         resolve,
       });
@@ -415,8 +433,21 @@ export class Jarvis {
   }
 
   // An answer clicked on the orb.
-  answerFromUi(id: number, allow: boolean): void {
-    if (this.asking?.id === id) this.answer(allow);
+  answerFromUi(id: number, allow: boolean, always = false): void {
+    if (this.asking?.id === id) this.answer(allow, undefined, always);
+  }
+
+  // Settings: the saved "Always allow" rules.
+  rulesEvent(): UiEvent {
+    return {
+      type: "rules",
+      rules: this.rules.rules.map((rule) => ({ label: describeRule(rule), folder: rule.cwd })),
+    };
+  }
+
+  removeRule(index: number): void {
+    this.rules.remove(index);
+    this.deps.emit(this.rulesEvent());
   }
 
   private async askNext(): Promise<void> {
@@ -433,6 +464,7 @@ export class Jarvis {
       detail: approval.detail,
       destructive: approval.destructive,
       taskId: approval.taskId,
+      always: approval.rule && `${describeRule(approval.rule)} in ${basename(approval.rule.cwd) || approval.rule.cwd}`,
     });
     await this.askAgain(approval.question);
   }
@@ -444,10 +476,14 @@ export class Jarvis {
     if (this.asking === approval) this.listen(ANSWER_CAPTURE, false, "asking");
   }
 
-  private answer(allow: boolean, reason = "The user said no."): void {
+  private answer(allow: boolean, reason = "The user said no.", always = false): void {
     const approval = this.asking;
     if (!approval) return;
     this.asking = undefined;
+    if (allow && always && approval.rule) {
+      this.rules.add(approval.rule);
+      this.deps.emit(this.rulesEvent());
+    }
     this.deps.listener.stopCapture();
     approval.resolve(allow
       ? { behavior: "allow", updatedInput: approval.request.input }
@@ -630,6 +666,7 @@ ${text}`.trim());
       if (!record || prompt === undefined) continue;
       this.taskPrompts.delete(task.id);
       sessions.startBackground(record.cwd, record.turns > 0 ? record : { ...record, claudeSessionId: null });
+      this.changes.set(task.id, new ChangeTracker(record.cwd));
       this.updateTask(task.id, { status: "running", startedAt: Date.now() });
       void this.runTaskTurn(task.id, prompt, prompt);
     }
@@ -646,6 +683,7 @@ ${text}`.trim());
       onText: (delta) => (replyText += delta),
       onTool: (name, input) => {
         tools.push(`${name} ${toolDetail(input)}`.trim());
+        this.changes.get(id)?.onTool(name, input);
         this.taskStep(id, name, input);
       },
     });
@@ -691,9 +729,15 @@ ${text}`.trim());
     const name = history.get(sessionId)?.title ?? "your earlier request";
     const first = new SentenceSplitter();
     const lead = [...first.push(reply), ...first.flush()][0] ?? "";
-    const text = failed ? `${name} ran into a problem, and nothing was changed after that.` : `Finished ${name}. ${lead}`.trim();
+    const tracker = this.changes.get(sessionId);
+    this.changes.delete(sessionId);
+    const { files, diff } = tracker?.collect() ?? { files: [], diff: "" };
+    const changed = tracker && tracker.touched > 0 ? ` ${spokenChanges(files)}` : "";
+    const text = failed
+      ? `${name} ran into a problem.${files.length > 0 ? changed : " No files were changed."}`
+      : `Finished ${name}. ${lead}${changed}`.replace(/\s+/g, " ").trim();
     this.updateTask(sessionId, { status: failed ? "failed" : "done", activity: "" });
-    emit({ type: "task_report", taskId: sessionId, title: name, summary: reply.trim() || text });
+    emit({ type: "task_report", taskId: sessionId, title: name, summary: reply.trim() || text, files, diff });
     this.unreported.push({ taskId: sessionId, text });
     this.sound("done"); // the report waits for the next "Hey Jarvis"
   }

@@ -45,6 +45,20 @@ struct Approval {
   let detail: String
   let destructive: Bool
   let taskId: Int?
+  let always: String? // what "Always allow" saves, e.g. "Run “npm test” in jarvis-ai"
+}
+
+struct FileChange: Identifiable {
+  var id: String { path }
+  let path: String
+  let added: Int
+  let removed: Int
+}
+
+struct AllowRuleItem: Identifiable {
+  let id: Int // position, for rule_remove
+  let label: String
+  let folder: String
 }
 
 // A past conversation in the History window (HistoryItem in brain/src/jarvis.ts).
@@ -79,6 +93,7 @@ struct Report: Identifiable {
   let id: Int // the task's id
   let title: String
   let summary: String
+  let files: [FileChange]
 }
 
 final class JarvisModel: ObservableObject {
@@ -94,6 +109,9 @@ final class JarvisModel: ObservableObject {
   @Published var tasks: [Int: TaskItem] = [:]
   @Published var taskSteps: [Int: [TaskStep]] = [:] // the Agents window's activity lists
   @Published var taskResults: [Int: String] = [:] // what each finished task reported
+  @Published var taskFiles: [Int: [FileChange]] = [:]
+  @Published var taskDiffs: [Int: String] = [:]
+  @Published var rules: [AllowRuleItem] = []
   @Published var reports: [Report] = [] // finished background work to show
   @Published var connected = false
   @Published var history: [HistoryItem] = [] // the History window's current search results
@@ -162,7 +180,8 @@ final class JarvisModel: ObservableObject {
         question: event["question"] as? String ?? "",
         detail: event["detail"] as? String ?? "",
         destructive: event["destructive"] as? Bool ?? false,
-        taskId: event["taskId"] as? Int)
+        taskId: event["taskId"] as? Int,
+        always: event["always"] as? String)
     case "approval_done":
       if approval?.id == event["id"] as? Int { approval = nil }
     case "task":
@@ -188,8 +207,17 @@ final class JarvisModel: ObservableObject {
     case "task_report":
       guard let id = event["taskId"] as? Int else { return }
       reports.removeAll { $0.id == id }
-      reports.append(Report(id: id, title: event["title"] as? String ?? "", summary: event["summary"] as? String ?? ""))
+      let files = (event["files"] as? [[String: Any]] ?? []).map { f in
+        FileChange(path: f["path"] as? String ?? "", added: f["added"] as? Int ?? 0, removed: f["removed"] as? Int ?? 0)
+      }
+      reports.append(Report(id: id, title: event["title"] as? String ?? "", summary: event["summary"] as? String ?? "", files: files))
       taskResults[id] = event["summary"] as? String ?? ""
+      taskFiles[id] = files
+      taskDiffs[id] = event["diff"] as? String ?? ""
+    case "rules":
+      rules = (event["rules"] as? [[String: Any]] ?? []).enumerated().map { index, r in
+        AllowRuleItem(id: index, label: r["label"] as? String ?? "", folder: r["folder"] as? String ?? "")
+      }
     case "history_results":
       historyProjects = event["projects"] as? [String] ?? []
       history = (event["sessions"] as? [[String: Any]] ?? []).map { s in
