@@ -20,7 +20,7 @@ The first start builds the Swift helpers and downloads the wake word and voice a
 
 - Say **"Hey Jarvis"** and your request in one breath, or pause after "Hey Jarvis" and then speak. Jarvis stops listening after 0.7 s of silence.
 - After it answers, you have 8 seconds to reply without the wake word (the ring around the orb).
-- Jarvis works from your home folder: Claude can read any of your files and run read-only commands freely. Before it edits a file or runs anything else, Jarvis asks out loud ("May I run the tests in jarvis-ai?") and shows the exact command with Allow / Deny buttons. Say yes or no; silence means no.
+- Jarvis works from your home folder: Claude can read any of your files and run read-only commands freely. Before it edits a file or runs anything else, Jarvis asks out loud ("May I run the tests in jarvis-ai?") and shows the exact command with Allow / Deny buttons. Say yes or no; silence means no. Commands that can't be undone (`git push`, `rm -r`, `git reset --hard`, `sudo`, …) need a click on Allow.
 - Waking Jarvis mid-answer silences it right away; Claude's work stops only if you then ask something else, say "stop", or say nothing.
 - Talk over Jarvis to interrupt it (about a third of a second of speech); "stop" or "never mind" just ends it. "Hey Jarvis", a click on the orb or Enter in the terminal also interrupt.
 - Sessions: a wake-up within 10 minutes continues the conversation; later ones start fresh. Voice commands:
@@ -29,7 +29,7 @@ The first start builds the Swift helpers and downloads the wake word and voice a
   - "switch to the payments platform project": new session in that folder under `~/Documents`
   - "what did we decide about the voice?": answers from past conversations
   - "what have we been working on?" / "what's running?": lists background tasks and recent conversations
-  - "keep going in the background" (say "Hey Jarvis" while Claude is working): the task carries on, your next request starts a fresh conversation, and Jarvis tells you (and shows a notification) when it's done. Up to three at once.
+  - "keep going in the background" (say "Hey Jarvis" while Claude is working): the task carries on and your next request starts a fresh conversation. Up to three at once. When one finishes you hear a chime and the menu bar icon shows a green count; Jarvis tells you about it first on your next "Hey Jarvis" ("Quick update first: …").
 - Every turn is saved to `~/Library/Application Support/Jarvis/jarvis.sqlite`; conversations get a short title after the first turn and a summary when Jarvis moves on.
 
 ## Layout
@@ -51,7 +51,7 @@ The first start builds the Swift helpers and downloads the wake word and voice a
 | `brain/src/speaker.ts` | Synthesizes the next sentence while the current one plays; barge-in |
 | `brain/src/approval-server.ts`, `approval-mcp.ts`, `approvals.ts` | Voice approvals: Claude Code's permission prompts → a spoken yes/no question |
 | `brain/src/ui-server.ts` | Token-protected loopback WebSocket for the UI |
-| `native/JarvisUI.swift` | Menu bar icon and floating orb + response panel (SwiftUI) |
+| `native/JarvisUI/` | Calm glass UI (SwiftUI): orb, conversation panel, approval and report cards, menu bar icon |
 | `native/mic-capture.swift` | Streams the default mic as 16 kHz PCM (AVAudioEngine), with Apple's echo cancellation |
 | `native/speak.swift` | Long-lived audio output helper: plays Kokoro audio or speaks with the system voice |
 | `brain/voice-rules.md` | System prompt addition that makes replies suitable for speech |

@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import type { ApprovalDecision, ApprovalRequest } from "./approval-server.ts";
-import { describeRequest, parseAnswer } from "./approvals.ts";
+import { describeActivity } from "./activity.ts";
+import { describeRequest, isDestructive, parseAnswer } from "./approvals.ts";
 import { parseCommand } from "./commands.ts";
 import type { HistoryStore } from "./history.ts";
 import type { CaptureOptions, Listener } from "./listener.ts";
@@ -22,19 +23,26 @@ export type UiEvent =
   | { type: "transcript"; text: string }
   | { type: "reply_start" }
   | { type: "reply_delta"; text: string }
-  | { type: "tool"; name: string; detail: string }
+  | { type: "tool"; name: string; detail: string; activity: string }
   | { type: "reply_done"; error?: string }
   | { type: "notice"; text: string }
   | { type: "session"; id: number; title: string | null; project: string }
-  | { type: "approval"; id: number; question: string; detail: string }
-  | { type: "approval_done"; id: number; allowed: boolean };
+  | { type: "approval"; id: number; question: string; detail: string; destructive: boolean; taskId?: number }
+  | { type: "approval_done"; id: number; allowed: boolean }
+  // A background task (its id is its session's id). `reported`: its result has been told to the user.
+  | { type: "task"; id: number; title: string; project: string; status: TaskStatus; activity: string;
+      startedAt: number; reported: boolean }
+  | { type: "task_report"; taskId: number; title: string; summary: string };
+
+export type TaskStatus = "running" | "done" | "failed" | "stopped";
 
 // UI -> brain.
 export type UiCommand =
   | { type: "activate" }
   | { type: "stop" }
   | { type: "quit" }
-  | { type: "approve"; id: number; allow: boolean };
+  | { type: "approve"; id: number; allow: boolean }
+  | { type: "report_seen"; taskId: number };
 
 const WAKE_CAPTURE: CaptureOptions = { preRollMs: 1500, noSpeechTimeoutMs: 5000 };
 const CLICK_CAPTURE: CaptureOptions = { preRollMs: 200, noSpeechTimeoutMs: 6000 };
@@ -61,7 +69,6 @@ export function isStopRequest(text: string): boolean {
   return words.length > 0 && words.length <= 10 && words.some((w) => STOP_WORDS.has(w))
     && words.every((w) => STOP_WORDS.has(w) || FILLER_WORDS.has(w));
 }
-const CHIME = "/System/Library/Sounds/Pop.aiff";
 
 export type JarvisDeps = {
   listener: Listener;
@@ -70,8 +77,8 @@ export type JarvisDeps = {
   sessions: SessionManager;
   history: HistoryStore;
   emit: (event: UiEvent) => void;
-  chime?: () => void;
-  notify?: (title: string, body: string) => void; // desktop notification; default: macOS
+  // "wake": Jarvis is listening; "done": a background task finished (its report waits for the next wake).
+  sound?: (name: "wake" | "done") => void;
 
   // Interrupt by talking over Jarvis. Needs echo cancellation, or Jarvis hears itself.
   bargeIn?: boolean;
@@ -82,6 +89,8 @@ type Approval = {
   request: ApprovalRequest;
   question: string;
   detail: string;
+  destructive: boolean; // needs a click, not a spoken yes
+  taskId?: number;
   retries: number;
   resolve: (decision: ApprovalDecision) => void;
 };
@@ -96,7 +105,10 @@ export class Jarvis {
   // Waking Jarvis mid-task silences it at once, but Claude keeps working until we know what
   // the user wants: "keep going in the background" must not kill the task.
   private interruptPending = false;
-  private announcements: string[] = []; // finished background tasks, spoken at the next idle moment
+  // Background tasks, and finished ones not yet told to the user (spoken first on the next wake).
+  private tasks = new Map<number, Extract<UiEvent, { type: "task" }>>();
+  private unreported: Array<{ taskId: number; text: string }> = [];
+  private lastActivity = ""; // the current turn's latest "what Jarvis is doing", carried into a handoff
   // Claude asking permission (edits, commands): one question at a time, answered by voice or on the orb.
   private approvals: Array<Approval> = [];
   private asking: Approval | undefined;
@@ -110,9 +122,39 @@ export class Jarvis {
   // "Hey Jarvis" or a click on the orb: stop talking and listen.
   activate(byVoice: boolean): void {
     this.holdReply();
-    this.gen++;
-    (this.deps.chime ?? chime)();
+    const gen = ++this.gen;
+    this.sound("wake");
+    if (this.unreported.length > 0 && !this.asking) {
+      void this.reportThenListen(gen);
+      return;
+    }
     this.listen(byVoice ? WAKE_CAPTURE : CLICK_CAPTURE, false);
+  }
+
+  // Finished background work is told first on the next wake: "Quick update first: …".
+  private async reportThenListen(gen: number): Promise<void> {
+    const reports = this.unreported.splice(0);
+    for (const { taskId } of reports) this.markReported(taskId);
+    const { speaker } = this.deps;
+    speaker.onFirstAudio = () => {
+      if (gen === this.gen) this.setState("speaking");
+    };
+    speaker.say(`Quick update first: ${reports.map((r) => r.text).join(" ")}`);
+    speaker.say("What did you want to ask?");
+    await speaker.idle();
+    if (gen === this.gen) this.listen(CLICK_CAPTURE, false);
+  }
+
+  // The user saw a task's report on screen (Agents window, report card).
+  reportSeen(taskId: number): void {
+    this.unreported = this.unreported.filter((r) => r.taskId !== taskId);
+    this.markReported(taskId);
+  }
+
+  private markReported(taskId: number): void {
+    const task = this.tasks.get(taskId);
+    if (!task || task.reported) return;
+    this.updateTask(taskId, { reported: true });
   }
 
   // The user started talking while Jarvis was speaking.
@@ -159,6 +201,9 @@ export class Jarvis {
       this.interruptPending = false; // "Hey Jarvis, yes" answers the question; it isn't an interruption
       this.deps.emit({ type: "transcript", text });
       const verdict = parseAnswer(text);
+      if (verdict === "yes" && this.asking.destructive) {
+        return this.askAgain("That one can't be undone, so please click Allow if you're sure.");
+      }
       if (verdict) return this.answer(verdict === "yes");
       if (this.asking.retries++ === 0) return this.askAgain("Sorry, was that a yes or a no?");
       return this.answer(false, `The user replied "${text}", which wasn't a clear yes.`);
@@ -263,6 +308,7 @@ export class Jarvis {
     const splitter = new SentenceSplitter();
     let replyText = "";
     const tools: string[] = [];
+    this.lastActivity = "";
     speaker.onFirstAudio = () => {
       if (gen === this.gen) this.setState("speaking");
     };
@@ -277,7 +323,13 @@ export class Jarvis {
       },
       onTool: (name, input) => {
         tools.push(`${name} ${toolDetail(input)}`.trim());
-        if (gen === this.gen) emit({ type: "tool", name, detail: toolDetail(input) });
+        const activity = describeActivity(name, input);
+        if (sessions.isBackground(sessionId)) {
+          this.updateTask(sessionId, { activity });
+        } else if (gen === this.gen) {
+          this.lastActivity = activity;
+          emit({ type: "tool", name, detail: toolDetail(input), activity });
+        }
       },
     });
     this.turn = turn;
@@ -325,8 +377,10 @@ export class Jarvis {
       this.approvals.push({
         id: this.nextApprovalId++,
         request,
-        question: background ? `For ${title ?? "the background task"}: ${question}` : question,
+        question: background ? `Sorry to cut in. For ${title ?? "the background task"}: ${question}` : question,
         detail,
+        destructive: isDestructive(request),
+        taskId: background ? request.sessionId : undefined,
         retries: 0,
         resolve,
       });
@@ -346,7 +400,14 @@ export class Jarvis {
     this.asking = approval;
     await this.deps.speaker.idle(); // let the sentence in progress finish
     if (this.asking !== approval) return;
-    this.deps.emit({ type: "approval", id: approval.id, question: approval.question, detail: approval.detail });
+    this.deps.emit({
+      type: "approval",
+      id: approval.id,
+      question: approval.question,
+      detail: approval.detail,
+      destructive: approval.destructive,
+      taskId: approval.taskId,
+    });
     await this.askAgain(approval.question);
   }
 
@@ -403,35 +464,45 @@ export class Jarvis {
     if (detached) {
       this.interruptPending = false;
       this.turn = Promise.resolve(); // the next request doesn't wait for the background turn
+      this.tasks.set(detached.id, {
+        type: "task",
+        id: detached.id,
+        title: detached.title ?? "Your earlier request",
+        project: detached.project,
+        status: "running",
+        activity: this.lastActivity,
+        startedAt: Date.now(),
+        reported: false,
+      });
+      this.deps.emit(this.tasks.get(detached.id)!);
     }
     return detached;
+  }
+
+  private updateTask(id: number, change: Partial<Extract<UiEvent, { type: "task" }>>): void {
+    const task = this.tasks.get(id);
+    if (!task) return;
+    const title = this.deps.history.get(id)?.title; // titles arrive a few seconds after the first turn
+    const updated = { ...task, ...(title ? { title } : {}), ...change };
+    this.tasks.set(id, updated);
+    this.deps.emit(updated);
   }
 
   private backgroundDone(sessionId: number, reply: string, failed: boolean): void {
     const { sessions, history, emit } = this.deps;
     sessions.finishBackground(sessionId);
-    const record = history.get(sessionId);
-    const name = record?.title ?? "your earlier request";
+    const name = history.get(sessionId)?.title ?? "your earlier request";
     const first = new SentenceSplitter();
     const lead = [...first.push(reply), ...first.flush()][0] ?? "";
-    const text = failed ? `${name} ran into a problem.` : `Finished ${name}. ${lead}`.trim();
-    emit({ type: "notice", text });
-    (this.deps.notify ?? notify)("Jarvis", text);
-    this.announcements.push(text);
-    void this.announce();
+    const text = failed ? `${name} ran into a problem, and nothing was changed after that.` : `Finished ${name}. ${lead}`.trim();
+    this.updateTask(sessionId, { status: failed ? "failed" : "done", activity: "" });
+    emit({ type: "task_report", taskId: sessionId, title: name, summary: reply.trim() || text });
+    this.unreported.push({ taskId: sessionId, text });
+    this.sound("done"); // the report waits for the next "Hey Jarvis"
   }
 
-  // Finished background tasks are spoken only when Jarvis is otherwise quiet.
-  private async announce(): Promise<void> {
-    if (this.state !== "idle" || this.announcements.length === 0) return;
-    const gen = this.gen;
-    const text = this.announcements.splice(0).join(" ");
-    this.deps.speaker.onFirstAudio = () => {
-      if (gen === this.gen) this.setState("speaking");
-    };
-    this.deps.speaker.say(text);
-    await this.deps.speaker.idle();
-    if (gen === this.gen) this.setState("idle");
+  private sound(name: "wake" | "done"): void {
+    (this.deps.sound ?? playSound)(name);
   }
 
   private fail(message: string): void {
@@ -445,7 +516,6 @@ export class Jarvis {
     this.state = state;
     this.deps.listener.watchForSpeech(this.bargeIn && state === "speaking");
     this.deps.emit({ type: "state", state, followUp: this.followUp });
-    if (state === "idle") void this.announce();
     if (state === "thinking" || state === "speaking" || state === "idle") void this.askNext();
   }
 }
@@ -482,12 +552,8 @@ function toolDetail(input: Record<string, unknown>): string {
   return String(detail).split("\n")[0].slice(0, 80);
 }
 
-function notify(title: string, body: string): void {
-  const quote = (s: string) => JSON.stringify(s.slice(0, 200));
-  spawn("osascript", ["-e", `display notification ${quote(body)} with title ${quote(title)}`], { stdio: "ignore" })
-    .on("error", () => {});
-}
+const SOUNDS = { wake: "/System/Library/Sounds/Pop.aiff", done: "/System/Library/Sounds/Glass.aiff" };
 
-function chime(): void {
-  spawn("afplay", ["-v", "0.4", CHIME], { stdio: "ignore" }).on("error", () => {});
+function playSound(name: "wake" | "done"): void {
+  spawn("afplay", ["-v", "0.4", SOUNDS[name]], { stdio: "ignore" }).on("error", () => {});
 }

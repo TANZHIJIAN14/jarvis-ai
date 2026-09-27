@@ -48,3 +48,24 @@ export function parseAnswer(text: string): "yes" | "no" | undefined {
 function lowerFirst(s: string): string {
   return s ? s[0].toLowerCase() + s.slice(1) : s;
 }
+
+// Commands that can't be undone need a click on Allow, not a spoken yes: a misheard
+// "yes" must never push, force-reset or delete recursively.
+const DESTRUCTIVE = [
+  /\brm\s+(?:-\S*[rR]|--recursive)/, // recursive delete
+  /\bgit\s+push\b/,
+  /\bgit\s+reset\s+--hard\b/,
+  /\bgit\s+clean\b/,
+  /\bgit\s+branch\s+-D\b/,
+  /\bgit\s+checkout\s+--\s/,
+  /\bsudo\b/,
+  /\bnpm\s+publish\b/,
+  /\bmkfs\b|\bdd\s+if=/,
+  /\bdrop\s+(?:table|database)\b/i,
+];
+
+export function isDestructive(req: ApprovalRequest): boolean {
+  if (req.toolName !== "Bash") return false;
+  const command = typeof req.input.command === "string" ? req.input.command : "";
+  return DESTRUCTIVE.some((re) => re.test(command));
+}
