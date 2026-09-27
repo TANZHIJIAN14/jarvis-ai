@@ -414,3 +414,87 @@ test("a destructive command can't be approved by voice: it needs a click", async
   ctx.jarvis.answerFromUi(asked.id, true);
   assert.equal((await decision).behavior, "allow");
 });
+
+// --- Agents window: tasks started, steered and stopped without voice ---
+
+const lastTask = (events: UiEvent[], id?: number) =>
+  events.filter((e) => e.type === "task" && (id === undefined || e.id === id)).at(-1) as Extract<UiEvent, { type: "task" }>;
+
+test("'New task…' runs in the background in the chosen project and reports back", async () => {
+  const ctx = setup([]);
+  const id = ctx.jarvis.startTask("Summarise the open issues", "payments platform")!;
+  await tick();
+  assert.equal(ctx.claudeStarts.at(-1)!.cwd, join(ctx.projectsDir, "payments-platform"));
+  assert.equal(ctx.claude.turns[0].text, "Summarise the open issues");
+  const started = lastTask(ctx.events, id);
+  assert.equal(started.status, "running");
+  assert.equal(started.origin, "window");
+  assert.equal(started.request, "Summarise the open issues");
+
+  ctx.claude.turns[0].handlers.onTool!("WebFetch", { url: "https://github.com/x/y/issues" });
+  const step = ctx.events.find((e) => e.type === "task_step") as Extract<UiEvent, { type: "task_step" }>;
+  assert.deepEqual([step.taskId, step.tool, step.detail], [id, "WebFetch", "Reading github.com"]);
+
+  ctx.claude.turns[0].handlers.onText!("Three issues matter.");
+  ctx.claude.turns[0].finish({ text: "Three issues matter.", sessionId: "claude-issues" });
+  await tick();
+  await tick();
+  assert.equal(lastTask(ctx.events, id).status, "done");
+  assert.equal(lastTask(ctx.events, id).claudeSessionId, "claude-issues", "for Copy resume command");
+  assert.ok(ctx.events.some((e) => e.type === "task_report" && e.taskId === id));
+});
+
+test("a fourth task waits for a free slot, then starts", async () => {
+  const ctx = setup([]);
+  const ids = ["one", "two", "three", "four"].map((t) => ctx.jarvis.startTask(`task ${t}`)!);
+  await tick();
+  assert.equal(ctx.claude.turns.length, 3);
+  assert.equal(lastTask(ctx.events, ids[3]).status, "queued");
+  ctx.claude.turns[0].finish({ text: "done" });
+  await tick();
+  await tick();
+  assert.equal(ctx.claude.turns.length, 4);
+  assert.equal(ctx.claude.turns[3].text, "task four");
+  assert.equal(lastTask(ctx.events, ids[3]).status, "running");
+});
+
+test("a note to a running task interrupts it and carries on with the note", async () => {
+  const ctx = setup([]);
+  const id = ctx.jarvis.startTask("Fix the flaky test")!;
+  await tick();
+  ctx.jarvis.noteTask(id, "skip the e2e tests");
+  assert.equal(ctx.claude.interrupts(), 1);
+  await tick();
+  await tick();
+  assert.equal(ctx.claude.turns.length, 2);
+  assert.match(ctx.claude.turns[1].text, /skip the e2e tests/);
+  assert.equal(lastTask(ctx.events, id).status, "running");
+  assert.equal(ctx.events.filter((e) => e.type === "task_report").length, 0, "not reported as finished");
+});
+
+test("stopping a task ends it without a report", async () => {
+  const ctx = setup([]);
+  const id = ctx.jarvis.startTask("Refactor everything")!;
+  await tick();
+  ctx.jarvis.stopTask(id);
+  await tick();
+  await tick();
+  assert.equal(lastTask(ctx.events, id).status, "stopped");
+  assert.equal(ctx.events.filter((e) => e.type === "task_report").length, 0);
+  assert.equal(ctx.sounds.filter((s) => s === "done").length, 0);
+});
+
+test("a note to a finished task asks a follow-up in the same conversation", async () => {
+  const ctx = setup([]);
+  const id = ctx.jarvis.startTask("Add search")!;
+  await tick();
+  ctx.claude.turns[0].finish({ text: "Added search.", sessionId: "claude-search" });
+  await tick();
+  await tick();
+  ctx.jarvis.noteTask(id, "add a test for the empty search");
+  await tick();
+  assert.equal(ctx.claudeStarts.at(-1)!.resume, "claude-search");
+  assert.equal(ctx.claude.turns[1].text, "add a test for the empty search");
+  assert.equal(lastTask(ctx.events, id).status, "running");
+  assert.equal(lastTask(ctx.events, id).reported, false);
+});

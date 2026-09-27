@@ -16,10 +16,27 @@ struct TaskItem: Identifiable {
   let id: Int
   var title: String
   var project: String
-  var status: String // running, done, failed, stopped
+  var status: String // queued, running, done, failed, stopped
   var activity: String
   var startedAt: Date
   var reported: Bool
+  var request: String
+  var origin: String // voice, window
+  var cwd: String
+  var claudeSessionId: String?
+
+  var isLive: Bool { status == "running" || status == "queued" }
+  var isFinished: Bool { status == "done" || status == "failed" || status == "stopped" }
+  var resumeCommand: String? {
+    claudeSessionId.map { "cd \"\(cwd)\" && claude --resume \($0)" }
+  }
+}
+
+struct TaskStep: Identifiable {
+  let id = UUID()
+  let tool: String
+  let detail: String
+  let at: Date
 }
 
 struct Approval {
@@ -27,6 +44,7 @@ struct Approval {
   let question: String
   let detail: String
   let destructive: Bool
+  let taskId: Int?
 }
 
 struct Report: Identifiable {
@@ -46,6 +64,8 @@ final class JarvisModel: ObservableObject {
   @Published var notice = ""
   @Published var approval: Approval?
   @Published var tasks: [Int: TaskItem] = [:]
+  @Published var taskSteps: [Int: [TaskStep]] = [:] // the Agents window's activity lists
+  @Published var taskResults: [Int: String] = [:] // what each finished task reported
   @Published var reports: [Report] = [] // finished background work to show
   @Published var connected = false
 
@@ -110,7 +130,8 @@ final class JarvisModel: ObservableObject {
         id: event["id"] as? Int ?? 0,
         question: event["question"] as? String ?? "",
         detail: event["detail"] as? String ?? "",
-        destructive: event["destructive"] as? Bool ?? false)
+        destructive: event["destructive"] as? Bool ?? false,
+        taskId: event["taskId"] as? Int)
     case "approval_done":
       if approval?.id == event["id"] as? Int { approval = nil }
     case "task":
@@ -122,11 +143,22 @@ final class JarvisModel: ObservableObject {
         status: event["status"] as? String ?? "running",
         activity: event["activity"] as? String ?? "",
         startedAt: Date(timeIntervalSince1970: (event["startedAt"] as? Double ?? 0) / 1000),
-        reported: event["reported"] as? Bool ?? false)
+        reported: event["reported"] as? Bool ?? false,
+        request: event["request"] as? String ?? "",
+        origin: event["origin"] as? String ?? "voice",
+        cwd: event["cwd"] as? String ?? "",
+        claudeSessionId: event["claudeSessionId"] as? String)
+    case "task_step":
+      guard let id = event["taskId"] as? Int else { return }
+      taskSteps[id, default: []].append(TaskStep(
+        tool: event["tool"] as? String ?? "",
+        detail: event["detail"] as? String ?? "",
+        at: Date(timeIntervalSince1970: (event["at"] as? Double ?? 0) / 1000)))
     case "task_report":
       guard let id = event["taskId"] as? Int else { return }
       reports.removeAll { $0.id == id }
       reports.append(Report(id: id, title: event["title"] as? String ?? "", summary: event["summary"] as? String ?? ""))
+      taskResults[id] = event["summary"] as? String ?? ""
     case "session":
       project = (event["project"] as? String ?? "")
       sessionTitle = event["title"] as? String

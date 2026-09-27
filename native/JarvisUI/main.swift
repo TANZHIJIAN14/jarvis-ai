@@ -3,7 +3,7 @@
 // streams state over a local WebSocket (UiEvent / UiCommand in brain/src/jarvis.ts).
 //
 // Build: npm run build:native (in brain/)
-// Run:   bin/JarvisUI --port 8765 --token <token>   (the brain launches it)
+// Run:   bin/JarvisUI --port 8765 --token <token>   (the brain launches it; --open-agents opens that window)
 
 import AppKit
 import Combine
@@ -19,6 +19,7 @@ struct JarvisView: View {
   var onOrbTap: () -> Void
   var onApprove: (Int, Bool) -> Void
   var onReportSeen: (Int) -> Void
+  var onOpenAgents: (Int?) -> Void
 
   var body: some View {
     VStack(spacing: 4) {
@@ -28,7 +29,7 @@ struct JarvisView: View {
         .help(model.state == "idle" ? "Talk to Jarvis" : "Stop")
       statusLine
       if model.hasContent || model.state != "idle" {
-        Panel(model: model, onApprove: onApprove, onReportSeen: onReportSeen)
+        Panel(model: model, onApprove: onApprove, onReportSeen: onReportSeen, onOpenAgents: onOpenAgents)
           .padding(.top, 6)
           .transition(.opacity.combined(with: .move(edge: .top)))
       }
@@ -57,6 +58,7 @@ struct JarvisView: View {
 final class AppDelegate: NSObject, NSApplicationDelegate {
   let model = JarvisModel()
   var brain: BrainConnection!
+  var agents: AgentsWindowController!
   var panel: NSPanel!
   var statusItem: NSStatusItem!
   var hideTimer: Timer?
@@ -64,6 +66,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     brain = BrainConnection(port: argument("--port") ?? "8765", token: argument("--token") ?? "", model: model)
+    agents = AgentsWindowController(model: model) { [weak self] command in self?.brain.send(command) }
     setUpStatusItem()
     setUpPanel()
     model.$state.sink { [weak self] state in self?.stateChanged(state) }.store(in: &observers)
@@ -72,6 +75,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       .sink { [weak self] in self?.refreshMenuBar() }
       .store(in: &observers)
     brain.connect()
+    if CommandLine.arguments.contains("--open-agents") { agents.show() } // for development
   }
 
   private func setUpStatusItem() {
@@ -96,6 +100,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     if model.state != "idle" {
       menu.addItem(withTitle: "Stop", action: #selector(stop), keyEquivalent: "").target = self
     }
+    menu.addItem(.separator())
+    let agentsItem = NSMenuItem(title: "Agents Window", action: #selector(openAgents), keyEquivalent: "a")
+    agentsItem.keyEquivalentModifierMask = [.command, .shift]
+    agentsItem.target = self
+    menu.addItem(agentsItem)
     menu.addItem(.separator())
     menu.addItem(withTitle: "Quit Jarvis", action: #selector(quit), keyEquivalent: "q").target = self
     statusItem.menu = menu
@@ -130,7 +139,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       onReportSeen: { [weak self] id in
         self?.model.dismissReport(id)
         self?.brain.send(["type": "report_seen", "taskId": id])
-      }))
+      },
+      onOpenAgents: { [weak self] id in self?.agents.show(selecting: id) }))
     if let screen = NSScreen.main?.visibleFrame {
       panel.setFrameTopLeftPoint(NSPoint(x: screen.midX - (Theme.panelWidth + 40) / 2, y: screen.maxY - 8))
     }
@@ -158,6 +168,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   @objc private func talk() { brain.send(["type": "activate"]) }
+  @objc func openAgents() { agents.show() }
   @objc private func stop() { brain.send(["type": "stop"]) }
   @objc private func quit() {
     brain.send(["type": "quit"])

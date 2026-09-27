@@ -21,6 +21,7 @@ The first start builds the Swift helpers and downloads the wake word and voice a
 - Say **"Hey Jarvis"** and your request in one breath, or pause after "Hey Jarvis" and then speak. Jarvis stops listening after 0.7 s of silence.
 - After it answers, you have 8 seconds to reply without the wake word (the ring around the orb).
 - Jarvis works from your home folder: Claude can read any of your files and run read-only commands freely. Before it edits a file or runs anything else, Jarvis asks out loud ("May I run the tests in jarvis-ai?") and shows the exact command with Allow / Deny buttons. Say yes or no; silence means no. Commands that can't be undone (`git push`, `rm -r`, `git reset --hard`, `sudo`, …) need a click on Allow.
+- **Agents window** (menu bar → Agents Window, or "Agents window" / "Details" in the panel): every background task with its request, activity, approvals and result. Start one without speaking (**New task…**, ⌘N, optionally in a project folder), send a note to a running task (it's interrupted and carries on with the note) or a follow-up to a finished one, **Stop** a task, or **Copy resume command** to continue it in the terminal. A fourth task waits until one of the three slots frees.
 - Waking Jarvis mid-answer silences it right away; Claude's work stops only if you then ask something else, say "stop", or say nothing.
 - Talk over Jarvis to interrupt it (about a third of a second of speech); "stop" or "never mind" just ends it. "Hey Jarvis", a click on the orb or Enter in the terminal also interrupt.
 - Sessions: a wake-up within 10 minutes continues the conversation; later ones start fresh. Voice commands:
@@ -51,7 +52,7 @@ The first start builds the Swift helpers and downloads the wake word and voice a
 | `brain/src/speaker.ts` | Synthesizes the next sentence while the current one plays; barge-in |
 | `brain/src/approval-server.ts`, `approval-mcp.ts`, `approvals.ts` | Voice approvals: Claude Code's permission prompts → a spoken yes/no question |
 | `brain/src/ui-server.ts` | Token-protected loopback WebSocket for the UI |
-| `native/JarvisUI/` | Calm glass UI (SwiftUI): orb, conversation panel, approval and report cards, menu bar icon |
+| `native/JarvisUI/` | Calm glass UI (SwiftUI): orb, conversation panel, approval and report cards, menu bar icon, Agents window |
 | `native/mic-capture.swift` | Streams the default mic as 16 kHz PCM (AVAudioEngine), with Apple's echo cancellation |
 | `native/speak.swift` | Long-lived audio output helper: plays Kokoro audio or speaks with the system voice |
 | `brain/voice-rules.md` | System prompt addition that makes replies suitable for speech |

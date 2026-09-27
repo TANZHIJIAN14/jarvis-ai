@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { basename } from "node:path";
 import type { ApprovalDecision, ApprovalRequest } from "./approval-server.ts";
 import { describeActivity } from "./activity.ts";
 import { describeRequest, isDestructive, parseAnswer } from "./approvals.ts";
@@ -31,10 +32,13 @@ export type UiEvent =
   | { type: "approval_done"; id: number; allowed: boolean }
   // A background task (its id is its session's id). `reported`: its result has been told to the user.
   | { type: "task"; id: number; title: string; project: string; status: TaskStatus; activity: string;
-      startedAt: number; reported: boolean }
+      startedAt: number; reported: boolean; request: string; origin: "voice" | "window"; cwd: string;
+      claudeSessionId: string | null }
+  | { type: "task_step"; taskId: number; tool: string; detail: string; at: number }
   | { type: "task_report"; taskId: number; title: string; summary: string };
 
-export type TaskStatus = "running" | "done" | "failed" | "stopped";
+export type TaskStatus = "queued" | "running" | "done" | "failed" | "stopped";
+type TaskEvent = Extract<UiEvent, { type: "task" }>;
 
 // UI -> brain.
 export type UiCommand =
@@ -42,7 +46,11 @@ export type UiCommand =
   | { type: "stop" }
   | { type: "quit" }
   | { type: "approve"; id: number; allow: boolean }
-  | { type: "report_seen"; taskId: number };
+  | { type: "report_seen"; taskId: number }
+  // The Agents window: start, steer and stop background tasks without speaking.
+  | { type: "task_new"; text: string; project?: string }
+  | { type: "task_note"; taskId: number; text: string }
+  | { type: "task_stop"; taskId: number };
 
 const WAKE_CAPTURE: CaptureOptions = { preRollMs: 1500, noSpeechTimeoutMs: 5000 };
 const CLICK_CAPTURE: CaptureOptions = { preRollMs: 200, noSpeechTimeoutMs: 6000 };
@@ -106,7 +114,10 @@ export class Jarvis {
   // the user wants: "keep going in the background" must not kill the task.
   private interruptPending = false;
   // Background tasks, and finished ones not yet told to the user (spoken first on the next wake).
-  private tasks = new Map<number, Extract<UiEvent, { type: "task" }>>();
+  private tasks = new Map<number, TaskEvent>();
+  private taskPrompts = new Map<number, string>(); // queued tasks: what to ask once a slot frees
+  private taskControl = new Map<number, { note?: string; stop?: boolean }>(); // requests for a running turn
+  private currentRequest = ""; // what the user asked in the current turn, kept if it moves to the background
   private unreported: Array<{ taskId: number; text: string }> = [];
   private lastActivity = ""; // the current turn's latest "what Jarvis is doing", carried into a handoff
   // Claude asking permission (edits, commands): one question at a time, answered by voice or on the orb.
@@ -309,6 +320,7 @@ export class Jarvis {
     let replyText = "";
     const tools: string[] = [];
     this.lastActivity = "";
+    this.currentRequest = text;
     speaker.onFirstAudio = () => {
       if (gen === this.gen) this.setState("speaking");
     };
@@ -325,7 +337,7 @@ export class Jarvis {
         tools.push(`${name} ${toolDetail(input)}`.trim());
         const activity = describeActivity(name, input);
         if (sessions.isBackground(sessionId)) {
-          this.updateTask(sessionId, { activity });
+          this.taskStep(sessionId, name, input);
         } else if (gen === this.gen) {
           this.lastActivity = activity;
           emit({ type: "tool", name, detail: toolDetail(input), activity });
@@ -338,7 +350,7 @@ export class Jarvis {
       sessions.recordTurn(sessionId, text, replyText.trim(), tools, result.sessionId);
     }
     if (sessions.isBackground(sessionId)) {
-      this.backgroundDone(sessionId, replyText, result.isError && !result.interrupted);
+      this.afterBackgroundTurn(sessionId, replyText, result.isError && !result.interrupted);
       return;
     }
     if (gen !== this.gen) return;
@@ -467,25 +479,161 @@ export class Jarvis {
       this.tasks.set(detached.id, {
         type: "task",
         id: detached.id,
-        title: detached.title ?? "Your earlier request",
+        title: detached.title ?? titleFrom(this.currentRequest),
         project: detached.project,
         status: "running",
         activity: this.lastActivity,
         startedAt: Date.now(),
         reported: false,
+        request: this.currentRequest,
+        origin: "voice",
+        cwd: detached.cwd,
+        claudeSessionId: detached.claudeSessionId,
       });
       this.deps.emit(this.tasks.get(detached.id)!);
     }
     return detached;
   }
 
-  private updateTask(id: number, change: Partial<Extract<UiEvent, { type: "task" }>>): void {
+  private updateTask(id: number, change: Partial<TaskEvent>): void {
     const task = this.tasks.get(id);
     if (!task) return;
-    const title = this.deps.history.get(id)?.title; // titles arrive a few seconds after the first turn
-    const updated = { ...task, ...(title ? { title } : {}), ...change };
+    const record = this.deps.history.get(id); // titles arrive a few seconds after the first turn
+    const updated = {
+      ...task,
+      ...(record?.title ? { title: record.title } : {}),
+      claudeSessionId: record?.claudeSessionId ?? task.claudeSessionId,
+      ...change,
+    };
     this.tasks.set(id, updated);
     this.deps.emit(updated);
+  }
+
+  // --- Background tasks started, steered and stopped from the Agents window ---
+
+  // "New task…": runs in the background, in the named project folder if one matches.
+  // Queued when all background slots are busy. Returns the task's id.
+  startTask(text: string, project?: string): number {
+    const { sessions, history } = this.deps;
+    const cwd = (project && sessions.findProject(project)) || sessions.defaultCwd;
+    const record = history.createSession(cwd, basename(cwd));
+    this.tasks.set(record.id, {
+      type: "task",
+      id: record.id,
+      title: titleFrom(text),
+      project: record.project,
+      status: "queued",
+      activity: "",
+      startedAt: Date.now(),
+      reported: false,
+      request: text,
+      origin: "window",
+      cwd,
+      claudeSessionId: null,
+    });
+    this.taskPrompts.set(record.id, text);
+    this.deps.emit(this.tasks.get(record.id)!);
+    this.startQueued();
+    return record.id;
+  }
+
+  // A note to a task: a running one is interrupted and carries on with the note (the design
+  // doc's fallback; the CLI can't take a message mid-turn); a finished one gets it as a follow-up.
+  noteTask(id: number, text: string): void {
+    const task = this.tasks.get(id);
+    if (!task) return;
+    if (task.status === "queued") {
+      this.taskPrompts.set(id, `${this.taskPrompts.get(id) ?? ""}
+
+${text}`.trim());
+      return;
+    }
+    if (task.status === "running") {
+      this.taskControl.set(id, { ...this.taskControl.get(id), note: text });
+      this.deps.sessions.backgroundClaude(id)?.interrupt();
+      return;
+    }
+    this.unreported = this.unreported.filter((r) => r.taskId !== id);
+    this.taskPrompts.set(id, text);
+    this.updateTask(id, { status: "queued", reported: false, activity: "" });
+    this.startQueued();
+  }
+
+  stopTask(id: number): void {
+    const task = this.tasks.get(id);
+    if (!task) return;
+    this.denyForTask(id, "The user stopped this task.");
+    if (task.status === "queued") {
+      this.taskPrompts.delete(id);
+      this.updateTask(id, { status: "stopped" });
+    } else if (task.status === "running") {
+      this.taskControl.set(id, { stop: true });
+      this.deps.sessions.backgroundClaude(id)?.interrupt();
+    }
+  }
+
+  private startQueued(): void {
+    const { sessions, history } = this.deps;
+    for (const task of [...this.tasks.values()]) {
+      if (task.status !== "queued" || !sessions.canStartBackground()) continue;
+      const record = history.get(task.id);
+      const prompt = this.taskPrompts.get(task.id);
+      if (!record || prompt === undefined) continue;
+      this.taskPrompts.delete(task.id);
+      sessions.startBackground(record.cwd, record.turns > 0 ? record : { ...record, claudeSessionId: null });
+      this.updateTask(task.id, { status: "running", startedAt: Date.now() });
+      void this.runTaskTurn(task.id, prompt, prompt);
+    }
+  }
+
+  // One turn of a background task (a window task, a note, or a follow-up).
+  private async runTaskTurn(id: number, prompt: string, userText: string): Promise<void> {
+    const { sessions } = this.deps;
+    const claude = sessions.backgroundClaude(id);
+    if (!claude) return;
+    let replyText = "";
+    const tools: string[] = [];
+    const result = await claude.ask(prompt, {
+      onText: (delta) => (replyText += delta),
+      onTool: (name, input) => {
+        tools.push(`${name} ${toolDetail(input)}`.trim());
+        this.taskStep(id, name, input);
+      },
+    });
+    if (!result.isError || result.interrupted) sessions.recordTurn(id, userText, replyText.trim(), tools, result.sessionId);
+    this.afterBackgroundTurn(id, replyText, result.isError && !result.interrupted);
+  }
+
+  // A background turn ended: stop it, carry on with a note, or finish and report.
+  private afterBackgroundTurn(id: number, reply: string, failed: boolean): void {
+    const control = this.taskControl.get(id);
+    this.taskControl.delete(id);
+    if (control?.stop) {
+      this.deps.sessions.finishBackground(id);
+      this.updateTask(id, { status: "stopped", activity: "" });
+    } else if (control?.note) {
+      const note = control.note;
+      void this.runTaskTurn(id, `A note from the user while you were working: ${note}\nTake it into account and carry on.`, note);
+      return;
+    } else {
+      this.backgroundDone(id, reply, failed);
+    }
+    this.startQueued();
+  }
+
+  private taskStep(id: number, tool: string, input: Record<string, unknown>): void {
+    const activity = describeActivity(tool, input);
+    this.deps.emit({ type: "task_step", taskId: id, tool, detail: activity, at: Date.now() });
+    this.updateTask(id, { activity });
+  }
+
+  private denyForTask(id: number, reason: string): void {
+    if (this.asking?.taskId === id) this.answer(false, reason);
+    this.approvals = this.approvals.filter((approval) => {
+      if (approval.taskId !== id) return true;
+      approval.resolve({ behavior: "deny", message: reason });
+      return false;
+    });
   }
 
   private backgroundDone(sessionId: number, reply: string, failed: boolean): void {
@@ -545,6 +693,12 @@ export function whenSpoken(at: number, now = Date.now()): string {
   if (day(at) === day(now - 86_400_000)) return "yesterday";
   if (now - at < 6 * 86_400_000) return `on ${new Date(at).toLocaleDateString("en-US", { weekday: "long" })}`;
   return `on ${new Date(at).toLocaleDateString("en-US", { month: "long", day: "numeric" })}`;
+}
+
+// A task's name until Claude's title arrives: the request, cut short.
+function titleFrom(request: string): string {
+  const text = request.trim().replace(/\s+/g, " ");
+  return text.length > 48 ? `${text.slice(0, 47)}…` : text || "Background task";
 }
 
 function toolDetail(input: Record<string, unknown>): string {
