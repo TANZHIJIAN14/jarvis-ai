@@ -9,6 +9,7 @@ struct Panel: View {
   @ObservedObject var model: JarvisModel
   var onApprove: (Int, Bool) -> Void
   var onReportSeen: (Int) -> Void
+  var onOpenAgents: (Int?) -> Void
 
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
@@ -19,18 +20,18 @@ struct Panel: View {
         ExchangeView(exchange: exchange, isLatest: index == model.thread.count - 1)
       }
       ForEach(model.reports) { report in
-        ReportCard(report: report) { onReportSeen(report.id) }
+        ReportCard(report: report, onDismiss: { onReportSeen(report.id) }, onDetails: { onOpenAgents(report.id) })
       }
       if let approval = model.approval {
         ApprovalCard(approval: approval, onApprove: onApprove)
       }
       ForEach(model.runningTasks) { task in
-        TaskLine(task: task)
+        TaskLine(task: task) { onOpenAgents(task.id) }
       }
       if !model.notice.isEmpty {
         Text(model.notice).font(.system(size: 13)).foregroundStyle(Theme.secondary)
       }
-      Footer(model: model)
+      Footer(model: model) { onOpenAgents(nil) }
     }
     .padding(16)
     .frame(width: Theme.panelWidth, alignment: .leading)
@@ -156,6 +157,7 @@ private struct ApprovalCard: View {
 private struct ReportCard: View {
   let report: Report
   var onDismiss: () -> Void
+  var onDetails: () -> Void
 
   var body: some View {
     VStack(alignment: .leading, spacing: 6) {
@@ -163,6 +165,7 @@ private struct ReportCard: View {
         Circle().strokeBorder(Theme.done, lineWidth: 1.5).frame(width: 8, height: 8)
         Text(report.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
         Spacer()
+        Button("Details", action: onDetails).buttonStyle(.link).font(.system(size: 12))
         Button("Dismiss", action: onDismiss).buttonStyle(.link).font(.system(size: 12))
       }
       Text(report.summary)
@@ -178,6 +181,7 @@ private struct ReportCard: View {
 
 private struct TaskLine: View {
   let task: TaskItem
+  var onDetails: () -> Void
 
   var body: some View {
     HStack(spacing: 10) {
@@ -195,6 +199,7 @@ private struct TaskLine: View {
           .font(.system(size: 12).monospacedDigit())
           .foregroundStyle(Theme.secondary)
       }
+      Button("Details", action: onDetails).buttonStyle(.link).font(.system(size: 12))
     }
     .padding(.horizontal, 12)
     .padding(.vertical, 10)
@@ -205,6 +210,7 @@ private struct TaskLine: View {
 
 private struct Footer: View {
   @ObservedObject var model: JarvisModel
+  var onOpenAgents: () -> Void
 
   var body: some View {
     let running = model.runningTasks.count
@@ -216,6 +222,8 @@ private struct Footer: View {
         Text("Say “never mind” to cancel")
       } else if model.approval != nil {
         Text("Jarvis needs you")
+      } else {
+        Button("Agents window", action: onOpenAgents).buttonStyle(.link)
       }
     }
     .font(.system(size: 12))

@@ -141,6 +141,9 @@ const ui = new UiServer({
     else if (command.type === "quit") shutdown();
     else if (command.type === "approve") jarvis.answerFromUi(command.id, command.allow);
     else if (command.type === "report_seen") jarvis.reportSeen(command.taskId);
+    else if (command.type === "task_new") jarvis.startTask(command.text, command.project);
+    else if (command.type === "task_note") jarvis.noteTask(command.taskId, command.text);
+    else if (command.type === "task_stop") jarvis.stopTask(command.taskId);
   },
 });
 await ui.start();

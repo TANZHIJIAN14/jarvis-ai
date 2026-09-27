@@ -46,6 +46,10 @@ export class SessionManager {
     return this.current && this.deps.history.get(this.current.record.id);
   }
 
+  get defaultCwd(): string {
+    return this.deps.defaultCwd;
+  }
+
   get claude(): ClaudeSession | undefined {
     return this.current?.claude;
   }
@@ -88,6 +92,25 @@ export class SessionManager {
     this.backgrounded.set(current.record.id, current);
     this.current = undefined;
     return current.record;
+  }
+
+  // Starts a task straight in the background (the Agents window's "New task…"), or picks a
+  // finished one back up for a follow-up. Undefined when all background slots are busy.
+  startBackground(cwd: string, resume?: SessionRecord): SessionRecord | undefined {
+    if (!this.canStartBackground()) return undefined;
+    const record = resume ?? this.deps.history.createSession(cwd, basename(cwd), this.now());
+    const claude = this.deps.newClaude({ cwd: record.cwd, resume: record.claudeSessionId ?? undefined, sessionId: record.id });
+    this.backgrounded.set(record.id, { record, claude });
+    claude.warm();
+    return record;
+  }
+
+  canStartBackground(): boolean {
+    return this.backgrounded.size < MAX_BACKGROUND;
+  }
+
+  backgroundClaude(id: number): ClaudeSession | undefined {
+    return this.backgrounded.get(id)?.claude;
   }
 
   isBackground(id: number): boolean {
