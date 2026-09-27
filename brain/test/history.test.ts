@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { describeRequest, parseAnswer } from "../src/approvals.ts";
 import { parseCommand } from "../src/commands.ts";
 import { HistoryStore, keywords } from "../src/history.ts";
 
@@ -45,8 +46,19 @@ test("parses session commands", () => {
     ["What did we decide about the voice?", { kind: "recall", query: "the voice" }],
     ["Remind me what we said about Sepang", { kind: "recall", query: "Sepang" }],
     ["What have we been working on?", { kind: "list" }],
+    ["Keep going in the background", { kind: "background" }],
+    ["Okay, do that in the background.", { kind: "background" }],
     ["What time is it?", { kind: "none" }],
     ["Switch the tests to Vitest", { kind: "none" }],
   ];
   for (const [text, expected] of cases) assert.deepEqual(parseCommand(text), expected, text);
+});
+
+test("phrases permission requests for speech and reads yes/no answers", () => {
+  assert.deepEqual(describeRequest({ sessionId: 1, toolName: "Bash", input: { command: "git commit -m x", description: "Commit the changes." } }),
+    { question: "May I commit the changes?", detail: "git commit -m x" });
+  assert.equal(describeRequest({ sessionId: 1, toolName: "WebFetch", input: { url: "https://f1.com/calendar" } }).question, "May I open f1.com?");
+  for (const t of ["Yes.", "Yeah, go ahead", "Hey Jarvis, do it", "Sure"]) assert.equal(parseAnswer(t), "yes", t);
+  for (const t of ["No.", "Nope", "Don't do that", "No, okay, don't"]) assert.equal(parseAnswer(t), "no", t);
+  assert.equal(parseAnswer("What does it do?"), undefined);
 });

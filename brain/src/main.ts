@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { ApprovalServer, type ApprovalDecision } from "./approval-server.ts";
 import { ClaudeSession } from "./claude-session.ts";
 import { HistoryStore, type SessionRecord } from "./history.ts";
 import { config } from "./config.ts";
@@ -88,16 +89,21 @@ const listener = new Listener(wakeWord, vad, {
 }, { wakeThreshold: config.wakeThreshold });
 
 const history = new HistoryStore(join(config.dataDir, "jarvis.sqlite"));
+// Claude asks here before edits and commands; Jarvis asks the user.
+const approvals = new ApprovalServer((request): Promise<ApprovalDecision> => jarvis.requestApproval(request));
+await approvals.start();
 const sessionEvent = (s: SessionRecord): UiEvent => ({ type: "session", id: s.id, title: s.title, project: s.project });
 const sessions = new SessionManager({
   history,
-  newClaude: ({ cwd, resume }) =>
+  newClaude: ({ cwd, resume, sessionId }) =>
     new ClaudeSession({
       cwd,
       resume,
       model: config.model,
       permissionMode: config.permissionMode,
       appendSystemPromptFile: voiceRules,
+      mcpConfig: approvals.mcpConfig(sessionId),
+      permissionPromptTool: "mcp__jarvis__approve",
     }),
   ask: claudeOneShot("haiku"),
   defaultCwd: config.workspace,
@@ -133,6 +139,7 @@ const ui = new UiServer({
     if (command.type === "activate") jarvis.activate(false);
     else if (command.type === "stop") jarvis.stop();
     else if (command.type === "quit") shutdown();
+    else if (command.type === "approve") jarvis.answerFromUi(command.id, command.allow);
   },
 });
 await ui.start();
@@ -238,6 +245,12 @@ function logEvent(event: UiEvent): void {
     case "notice":
       log(dim(`  (${event.text})`));
       break;
+    case "approval":
+      log(`${cyan("Jarvis asks:")} ${event.question}${event.detail ? dim(`  [${event.detail}]`) : ""}`);
+      break;
+    case "approval_done":
+      log(dim(`  (${event.allowed ? "approved" : "not approved"})`));
+      break;
   }
 }
 
@@ -247,6 +260,7 @@ function shutdown(): void {
   mic.stop();
   jarvis.close();
   history.close();
+  approvals.close();
   speaker.close();
   kokoro?.close();
   transcriber.stop();

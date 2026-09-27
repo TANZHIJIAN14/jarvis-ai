@@ -7,6 +7,7 @@ export type Command =
   | { kind: "project"; name: string } // "switch to the payments platform project"
   | { kind: "recall"; query: string } // "what did we decide about the voice?"
   | { kind: "list" } // "what have we been working on?"
+  | { kind: "background" } // "keep going in the background" (only meaningful while Claude is working)
   | { kind: "none" };
 
 const NEW = /^(?:let's\s+)?(?:new (?:session|conversation|chat)|fresh start|start over|start (?:a )?(?:new|fresh) (?:session|conversation|chat))\b/i;
@@ -16,8 +17,11 @@ const RESUME = /^(?:let's\s+)?(?:go back to|back to|return to|resume|pick up|con
 const RECALL = /^(?:remind me\s+)?what (?:(?:did|have|had) )?(?:we|i) (?:decide|decided|discuss|discussed|say|said|talk about|talked about|conclude|concluded|agree|agreed|settle|settled)(?: on)? (?:about |on |regarding |for |with )?(.+?)\W*$/i;
 const LIST = /^(?:what (?:have|were|are) we (?:been )?(?:working on|doing|talking about)|(?:list|show)(?: me)? (?:my |our |the )?(?:recent )?(?:sessions|conversations|chats)|what(?:'s| is) running)\b/i;
 
+const BACKGROUND = /^(?:(?:ok(?:ay)?|alright|right|yes|yeah)\W+)?(?:keep (?:going|working)|carry on|continue in the background|let it (?:run|keep going)|(?:do|finish|work on) (?:it|that|this) in the background|(?:put|move|send) (?:it|that|this) (?:in|into|to) the background|background (?:it|that|this))\b/i;
+
 export function parseCommand(text: string): Command {
   const t = text.trim();
+  if (BACKGROUND.test(t)) return { kind: "background" };
   if (NEW.test(t)) return { kind: "new" };
   if (LIST.test(t)) return { kind: "list" };
   let m = PROJECT.exec(t) ?? PROJECT_OPEN.exec(t);

@@ -11,15 +11,19 @@ import type { Ask } from "./oneshot.ts";
 //    starts one in that project folder.
 // Every session is recorded in the history store, titled after its first turn and
 // summarised when Jarvis moves on from it.
+//
+// "Keep going in the background" detaches a busy session: its turn runs on while the next
+// request starts a fresh session. At most MAX_BACKGROUND run at once.
 
 const IDLE_MS = 10 * 60_000;
+export const MAX_BACKGROUND = 3;
 // Every keyword of "go back to <description>" must appear somewhere in the session;
 // anything weaker is treated as a normal request ("continue the story").
 const MIN_RESUME_COVERAGE = 1;
 
 export type SessionManagerDeps = {
   history: HistoryStore;
-  newClaude: (opts: { cwd: string; resume?: string }) => ClaudeSession;
+  newClaude: (opts: { cwd: string; resume?: string; sessionId: number }) => ClaudeSession;
   ask?: Ask; // titles and summaries; skipped when absent
   defaultCwd: string;
   projectsDir: string;
@@ -31,7 +35,8 @@ export type SessionManagerDeps = {
 export class SessionManager {
   private deps: SessionManagerDeps;
   private current: { record: SessionRecord; claude: ClaudeSession } | undefined;
-  private background: Promise<unknown>[] = [];
+  private backgrounded = new Map<number, { record: SessionRecord; claude: ClaudeSession }>();
+  private pending: Promise<unknown>[] = []; // titles and summaries in flight
 
   constructor(deps: SessionManagerDeps) {
     this.deps = deps;
@@ -61,7 +66,7 @@ export class SessionManager {
   startNew(cwd = this.deps.defaultCwd): SessionRecord {
     this.finishCurrent();
     const record = this.deps.history.createSession(cwd, basename(cwd), this.now());
-    this.current = { record, claude: this.deps.newClaude({ cwd }) };
+    this.current = { record, claude: this.deps.newClaude({ cwd, sessionId: record.id }) };
     this.current.claude.warm();
     this.deps.onChange?.(record);
     return record;
@@ -69,17 +74,46 @@ export class SessionManager {
 
   resume(record: SessionRecord): void {
     this.finishCurrent();
-    const claude = this.deps.newClaude({ cwd: record.cwd, resume: record.claudeSessionId ?? undefined });
+    const claude = this.deps.newClaude({ cwd: record.cwd, resume: record.claudeSessionId ?? undefined, sessionId: record.id });
     this.current = { record, claude };
     claude.warm();
     this.deps.onChange?.(record);
+  }
+
+  // Moves the busy current session to the background; the next request starts a fresh one.
+  // Undefined when there's nothing running or no room for another background task.
+  detach(): SessionRecord | undefined {
+    const current = this.current;
+    if (!current?.claude.busy || this.backgrounded.size >= MAX_BACKGROUND) return undefined;
+    this.backgrounded.set(current.record.id, current);
+    this.current = undefined;
+    return current.record;
+  }
+
+  isBackground(id: number): boolean {
+    return this.backgrounded.has(id);
+  }
+
+  // Sessions working in the background, freshest record first.
+  running(): SessionRecord[] {
+    return [...this.backgrounded.keys()].map((id) => this.deps.history.get(id)!).reverse();
+  }
+
+  // A background task finished: free its process. It can still be resumed by name.
+  finishBackground(id: number): void {
+    const entry = this.backgrounded.get(id);
+    if (!entry) return;
+    this.backgrounded.delete(id);
+    entry.claude.close();
+    const record = this.deps.history.get(id);
+    if (record && record.turns > 0) this.summarizeLater(record);
   }
 
   // A past session matching a spoken description, other than the current one.
   findSession(query: string): SessionRecord | undefined {
     const best = this.deps.history
       .findSessions(query)
-      .find((m) => m.session.id !== this.current?.record.id);
+      .find((m) => m.session.id !== this.current?.record.id && !this.backgrounded.has(m.session.id));
     return best && best.coverage >= MIN_RESUME_COVERAGE ? best.session : undefined;
   }
 
@@ -98,24 +132,25 @@ export class SessionManager {
     return best?.path;
   }
 
-  recordTurn(user: string, reply: string, tools: string[], claudeSessionId: string | undefined): void {
-    const record = this.current?.record;
-    if (!record) return;
-    this.deps.history.addTurn(record.id, user, reply, tools, this.now());
-    if (claudeSessionId) this.deps.history.update(record.id, { claudeSessionId });
-    const updated = this.deps.history.get(record.id)!;
+  // Records a turn against the session it ran in (which may have moved to the background).
+  recordTurn(sessionId: number, user: string, reply: string, tools: string[], claudeSessionId: string | undefined): void {
+    this.deps.history.addTurn(sessionId, user, reply, tools, this.now());
+    if (claudeSessionId) this.deps.history.update(sessionId, { claudeSessionId });
+    const updated = this.deps.history.get(sessionId)!;
     if (updated.turns === 1 && !updated.title) this.titleLater(updated);
-    this.deps.onChange?.(updated);
+    if (this.current?.record.id === sessionId) this.deps.onChange?.(updated);
   }
 
   close(): void {
     this.current?.claude.close();
     this.current = undefined;
+    for (const { claude } of this.backgrounded.values()) claude.close();
+    this.backgrounded.clear();
   }
 
   // For tests and shutdown: wait for pending titles and summaries.
   async settle(): Promise<void> {
-    await Promise.allSettled(this.background);
+    await Promise.allSettled(this.pending);
   }
 
   private finishCurrent(): void {
@@ -160,7 +195,7 @@ export class SessionManager {
 
   private track(work: Promise<unknown>): void {
     // A failed title or summary only costs a nicer label; never let it surface as a crash.
-    this.background.push(work.catch(() => {}));
+    this.pending.push(work.catch(() => {}));
   }
 
   private now(): number {

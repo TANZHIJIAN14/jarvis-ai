@@ -63,7 +63,7 @@ function setup(transcripts: string[], opts: { bargeIn?: boolean; history?: Histo
   const history = opts.history ?? new HistoryStore(":memory:");
   const projectsDir = mkdtempSync(join(tmpdir(), "jarvis-projects-"));
   mkdirSync(join(projectsDir, "payments-platform"));
-  const claudeStarts: Array<{ cwd: string; resume?: string }> = [];
+  const claudeStarts: Array<{ cwd: string; resume?: string; sessionId: number }> = [];
   const sessions = new SessionManager({
     history,
     newClaude: (o) => {
@@ -73,7 +73,9 @@ function setup(transcripts: string[], opts: { bargeIn?: boolean; history?: Histo
     defaultCwd: "/tmp/jarvis-workspace",
     projectsDir,
   });
+  const notes: string[] = [];
   const jarvis = new Jarvis({
+    notify: (_title, body) => notes.push(body),
     listener: {
       startCapture: (o: CaptureOptions) => captures.push(o),
       stopCapture() {},
@@ -88,7 +90,7 @@ function setup(transcripts: string[], opts: { bargeIn?: boolean; history?: Histo
     bargeIn: opts.bargeIn,
   });
   const states = () => events.filter((e) => e.type === "state").map((e) => (e as { state: string }).state);
-  return { jarvis, events, captures, spoken, claude, states, watching, history, claudeStarts, projectsDir };
+  return { jarvis, events, captures, spoken, claude, states, watching, history, claudeStarts, projectsDir, notes };
 }
 
 test("a full turn: wake, transcribe, reply by voice, then a follow-up window", async () => {
@@ -110,7 +112,7 @@ test("a full turn: wake, transcribe, reply by voice, then a follow-up window", a
   assert.equal(jarvis.followUp, true);
 });
 
-test("saying the wake word mid-reply interrupts Claude and listens again", async () => {
+test("saying the wake word mid-reply silences Jarvis; a new request interrupts Claude", async () => {
   const { jarvis, spoken, claude, states } = setup(["Jarvis, tell me a long story", "never mind, what's the weather"]);
   jarvis.activate(true);
   const first = jarvis.onUtterance(new Int16Array(16));
@@ -118,11 +120,12 @@ test("saying the wake word mid-reply interrupts Claude and listens again", async
   claude.turns[0].handlers.onText!("Once upon a time, ");
 
   jarvis.activate(true); // barge-in
-  assert.equal(claude.interrupts(), 1);
-  await first;
-  assert.equal(states().at(-1), "listening", "the old turn doesn't take over the state");
+  assert.equal(claude.interrupts(), 0, "Claude keeps working until we know what the user wants");
+  assert.equal(states().at(-1), "listening");
 
   const second = jarvis.onUtterance(new Int16Array(16));
+  await first;
+  assert.equal(claude.interrupts(), 1);
   await tick();
   await tick();
   assert.equal(claude.turns[1].text, "never mind, what's the weather");
@@ -158,13 +161,13 @@ test("talking over Jarvis interrupts it and captures what was said", async () =>
   assert.equal(watching.at(-1), true, "watches for speech only while speaking");
 
   jarvis.onBargeIn();
-  assert.equal(claude.interrupts(), 1);
   assert.equal(watching.at(-1), false);
   assert.equal(captures.at(-1)!.speechStarted, true, "the interrupting words are in the pre-roll");
-  await first;
   assert.equal(states().at(-1), "listening");
 
   const second = jarvis.onUtterance(new Int16Array(16));
+  await first;
+  assert.equal(claude.interrupts(), 1);
   await tick();
   await tick();
   assert.equal(claude.turns[1].text, "wait, use the other branch");
@@ -233,7 +236,7 @@ test("'go back to …' resumes a past session by what it was about", async () =>
   assert.deepEqual(ctx.spoken.slice(-1), ["Okay, starting fresh."]);
   await turn(ctx, "");
   assert.match(ctx.spoken.at(-1)!, /^Back to our conversation from earlier today\.$/);
-  assert.deepEqual(ctx.claudeStarts.at(-1), { cwd: "/tmp/jarvis-workspace", resume: "claude-1" });
+  assert.deepEqual(ctx.claudeStarts.at(-1), { cwd: "/tmp/jarvis-workspace", resume: "claude-1", sessionId: 1 });
   assert.equal(ctx.claude.turns.length, 1, "commands never reach Claude");
 });
 
@@ -260,4 +263,107 @@ test("'what did we decide about …' hands Claude the relevant past turns", asyn
   assert.match(prompt, /George, the British Kokoro voice/);
   assert.equal(ctx.history.transcript(ctx.history.recent()[0].id)[0].user, "What did we decide about the voice?",
     "history keeps what the user said, not the notes");
+});
+
+test("'keep going in the background' leaves Claude working and reports back when done", async () => {
+  const ctx = setup(["Jarvis, refactor the auth module", "keep going in the background", "what time is it?"]);
+  const { jarvis, claude, spoken, notes, claudeStarts } = ctx;
+  jarvis.activate(true);
+  const first = jarvis.onUtterance(new Int16Array(16));
+  await tick();
+  claude.turns[0].handlers.onText!("Starting on the auth module. ");
+
+  jarvis.activate(true);
+  await jarvis.onUtterance(new Int16Array(16));
+  assert.equal(claude.interrupts(), 0, "the task was not killed");
+  assert.equal(spoken.at(-1), "Okay, I'll keep working on that and let you know when it's done.");
+
+  // The next request goes to a fresh session while the first keeps running.
+  jarvis.activate(true);
+  const third = jarvis.onUtterance(new Int16Array(16));
+  await tick();
+  assert.equal(claudeStarts.length, 2, "a new Claude session for the next request");
+  claude.turns[1].handlers.onText!("It's three.");
+  claude.turns[1].finish({ text: "It's three.", sessionId: "c2" });
+  await third;
+
+  jarvis.stop(); // quiet moment
+  claude.turns[0].handlers.onText!("Done: I split it into three files.");
+  claude.turns[0].finish({ text: "Done", sessionId: "c1" });
+  await first;
+  await tick();
+  assert.match(notes[0], /^Finished your earlier request\. Starting on the auth module\./);
+  assert.equal(spoken.at(-1), notes[0], "announced out loud once Jarvis was idle");
+  assert.equal(ctx.history.transcript(1)[0].user, "refactor the auth module", "recorded in its own session");
+});
+
+test("'keep going' with nothing running is a normal request", async () => {
+  const ctx = setup(["keep going with the story"]);
+  await turn(ctx, "And then...");
+  assert.equal(ctx.claude.turns[0].text, "keep going with the story");
+});
+
+test("'what's running?' lists background tasks", async () => {
+  const ctx = setup(["Jarvis, refactor the auth module", "keep going in the background", "what's running?"]);
+  ctx.jarvis.activate(true);
+  void ctx.jarvis.onUtterance(new Int16Array(16));
+  await tick();
+  ctx.jarvis.activate(true);
+  await ctx.jarvis.onUtterance(new Int16Array(16));
+  ctx.jarvis.activate(true);
+  await ctx.jarvis.onUtterance(new Int16Array(16));
+  assert.match(ctx.spoken.at(-1)!, /^Working in the background: jarvis workspace\.$/);
+});
+
+test("asks out loud before an edit or command, and passes the answer to Claude", async () => {
+  const ctx = setup(["Jarvis, run the tests", "yes, go ahead"]);
+  const { jarvis, claude, spoken, events, captures } = ctx;
+  jarvis.activate(true);
+  const reply = jarvis.onUtterance(new Int16Array(16));
+  await tick();
+  const decision = jarvis.requestApproval({
+    sessionId: 1,
+    toolName: "Bash",
+    input: { command: "npm test", description: "Run the test suite in jarvis-ai" },
+  });
+  await tick();
+  assert.equal(spoken.at(-1), "May I run the test suite in jarvis-ai?");
+  assert.equal(jarvis.state, "asking");
+  assert.equal(captures.at(-1)!.noSpeechTimeoutMs, 10_000);
+  assert.ok(events.some((e) => e.type === "approval" && e.detail === "npm test"), "the exact command is shown");
+
+  await jarvis.onUtterance(new Int16Array(16));
+  assert.deepEqual(await decision, { behavior: "allow", updatedInput: { command: "npm test", description: "Run the test suite in jarvis-ai" } });
+  assert.equal(jarvis.state, "thinking", "back to Claude's work");
+  claude.turns[0].finish({});
+  await reply;
+});
+
+test("silence, a no, or an unclear answer twice means not approved", async () => {
+  const ctx = setup(["banana", "purple"]);
+  const ask = () => ctx.jarvis.requestApproval({ sessionId: 1, toolName: "Write", input: { file_path: "/Users/me/notes.md" } });
+
+  const silent = ask();
+  await tick();
+  assert.equal(ctx.spoken.at(-1), "May I write notes.md?");
+  ctx.jarvis.onNoSpeech();
+  assert.equal((await silent).behavior, "deny");
+
+  const unclear = ask();
+  await tick();
+  await ctx.jarvis.onUtterance(new Int16Array(16)); // "banana"
+  await tick();
+  assert.equal(ctx.spoken.at(-1), "Sorry, was that a yes or a no?");
+  await ctx.jarvis.onUtterance(new Int16Array(16)); // "purple"
+  const d = await unclear;
+  assert.equal(d.behavior, "deny");
+});
+
+test("an approval can be answered on the orb", async () => {
+  const ctx = setup([]);
+  const decision = ctx.jarvis.requestApproval({ sessionId: 1, toolName: "Edit", input: { file_path: "/x/README.md" } });
+  await tick();
+  const asked = ctx.events.find((e) => e.type === "approval") as { id: number };
+  ctx.jarvis.answerFromUi(asked.id, true);
+  assert.equal((await decision).behavior, "allow");
 });

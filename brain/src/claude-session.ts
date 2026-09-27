@@ -23,6 +23,9 @@ export type SessionOptions = {
   permissionMode?: string;
   appendSystemPromptFile?: string;
   resume?: string;
+  // Ask the user before edits and commands: an MCP server (JSON) and its approval tool.
+  mcpConfig?: string;
+  permissionPromptTool?: string;
 };
 
 type Turn = { handlers: TurnHandlers; resolve: (r: TurnResult) => void };
@@ -75,7 +78,7 @@ export class ClaudeSession {
   }
 
   private spawn(): void {
-    const { cwd, model, permissionMode, appendSystemPromptFile } = this.opts;
+    const { cwd, model, permissionMode, appendSystemPromptFile, mcpConfig, permissionPromptTool } = this.opts;
     const args = [
       "-p",
       "--input-format", "stream-json",
@@ -86,6 +89,8 @@ export class ClaudeSession {
     if (model) args.push("--model", model);
     if (permissionMode) args.push("--permission-mode", permissionMode);
     if (appendSystemPromptFile) args.push("--append-system-prompt-file", appendSystemPromptFile);
+    if (mcpConfig) args.push("--mcp-config", mcpConfig);
+    if (permissionPromptTool) args.push("--permission-prompt-tool", permissionPromptTool);
     if (this.sessionId) args.push("--resume", this.sessionId);
 
     // Own process group, so Ctrl+C in Jarvis's terminal doesn't also hit Claude.
