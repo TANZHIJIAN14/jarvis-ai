@@ -25,11 +25,14 @@ export const config = {
   projectsDir: env.JARVIS_PROJECTS_DIR ?? join(homedir(), "Documents"),
   // Jarvis's own data: the session history database.
   dataDir: env.JARVIS_DATA_DIR ?? join(homedir(), "Library/Application Support/Jarvis"),
-  // Folder Claude Code works in. Brainstorming lives here, away from real code.
-  workspace: env.JARVIS_WORKSPACE ?? join(homedir(), "jarvis-workspace"),
+  // Folder Claude Code starts in. Home, so Claude can read all your projects; anything that
+  // changes files or runs commands is asked for out loud first (see permissionMode).
+  workspace: env.JARVIS_WORKSPACE ?? homedir(),
   // Claude model alias; unset = the CLI's default.
   model: env.JARVIS_MODEL,
-  permissionMode: env.JARVIS_PERMISSION_MODE ?? "acceptEdits",
+  // "manual": reads and read-only commands run freely; edits and other commands need the
+  // user's spoken (or clicked) approval.
+  permissionMode: env.JARVIS_PERMISSION_MODE ?? "manual",
   // "kokoro" (local neural voice) or "apple" (system voice).
   tts: env.JARVIS_TTS ?? "kokoro",
   // Kokoro voice (e.g. bm_george, bm_daniel, bm_lewis, bm_fable, am_michael) or,

@@ -26,8 +26,9 @@ final class JarvisModel: ObservableObject {
   @Published var notice = ""
   @Published var connected = false
   @Published var sessionLabel = "" // "project · title" of the current conversation
+  @Published var approval: (id: Int, question: String, detail: String)? // Claude asking permission
 
-  var hasCard: Bool { !transcript.isEmpty || !reply.isEmpty || !notice.isEmpty }
+  var hasCard: Bool { !transcript.isEmpty || !reply.isEmpty || !notice.isEmpty || approval != nil }
 
   func apply(_ event: [String: Any]) {
     switch event["type"] as? String {
@@ -57,6 +58,10 @@ final class JarvisModel: ObservableObject {
       if let error = event["error"] as? String { notice = error }
     case "notice":
       notice = event["text"] as? String ?? ""
+    case "approval":
+      approval = (event["id"] as? Int ?? 0, event["question"] as? String ?? "", event["detail"] as? String ?? "")
+    case "approval_done":
+      if approval?.id == event["id"] as? Int { approval = nil }
     case "session":
       let project = (event["project"] as? String ?? "").replacingOccurrences(of: "-", with: " ")
       let title = event["title"] as? String
@@ -97,6 +102,10 @@ final class BrainConnection {
     task?.send(.string("{\"type\":\"\(type)\"}")) { _ in }
   }
 
+  func sendApproval(id: Int, allow: Bool) {
+    task?.send(.string("{\"type\":\"approve\",\"id\":\(id),\"allow\":\(allow)}")) { _ in }
+  }
+
   private func receive(_ task: URLSessionWebSocketTask) {
     task.receive { [weak self] result in
       guard let self else { return }
@@ -130,6 +139,7 @@ struct Orb: View {
     case "listening": return Color(red: 0.2, green: 0.85, blue: 1.0)
     case "transcribing", "thinking": return Color(red: 0.45, green: 0.55, blue: 1.0)
     case "speaking": return Color(red: 0.55, green: 0.95, blue: 1.0)
+    case "asking": return Color(red: 1.0, green: 0.72, blue: 0.25)
     default: return Color(white: 0.6)
     }
   }
@@ -145,6 +155,7 @@ struct Orb: View {
         case "listening": pulse = 1 + model.level * 0.45
         case "speaking": pulse = 1 + 0.08 * sin(t * 9) + 0.05 * sin(t * 13.7)
         case "thinking", "transcribing": pulse = 1 + 0.03 * sin(t * 2)
+        case "asking": pulse = 1 + 0.06 * sin(t * 4)
         default: pulse = 1
         }
         let r = base * pulse
@@ -191,9 +202,32 @@ struct Orb: View {
 
 struct Card: View {
   @ObservedObject var model: JarvisModel
+  var onApprove: (Int, Bool) -> Void = { _, _ in }
 
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
+      if let approval = model.approval {
+        VStack(alignment: .leading, spacing: 6) {
+          Text(approval.question)
+            .font(.system(size: 14, weight: .semibold))
+          if !approval.detail.isEmpty {
+            Text(approval.detail)
+              .font(.system(size: 12, design: .monospaced))
+              .foregroundStyle(.secondary)
+              .lineLimit(4)
+              .textSelection(.enabled)
+          }
+          HStack {
+            Button("Allow") { onApprove(approval.id, true) }
+              .keyboardShortcut(.defaultAction)
+            Button("Deny") { onApprove(approval.id, false) }
+            Spacer()
+            Text("or say yes / no").font(.system(size: 11)).foregroundStyle(.secondary)
+          }
+        }
+        .padding(10)
+        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+      }
       if !model.transcript.isEmpty {
         Text(model.transcript)
           .font(.system(size: 13))
@@ -239,6 +273,7 @@ struct Card: View {
 struct JarvisView: View {
   @ObservedObject var model: JarvisModel
   var onOrbTap: () -> Void
+  var onApprove: (Int, Bool) -> Void
 
   var body: some View {
     VStack(spacing: 4) {
@@ -256,7 +291,7 @@ struct JarvisView: View {
           .background(.ultraThinMaterial, in: Capsule())
       }
       if model.hasCard {
-        Card(model: model)
+        Card(model: model, onApprove: onApprove)
           .transition(.opacity.combined(with: .move(edge: .top)))
       }
       Spacer(minLength: 0)
@@ -305,7 +340,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     panel.isOpaque = false
     panel.hasShadow = false
     panel.becomesKeyOnlyIfNeeded = true
-    panel.contentView = NSHostingView(rootView: JarvisView(model: model) { [weak self] in self?.orbTapped() })
+    panel.contentView = NSHostingView(rootView: JarvisView(
+      model: model,
+      onOrbTap: { [weak self] in self?.orbTapped() },
+      onApprove: { [weak self] id, allow in self?.brain.sendApproval(id: id, allow: allow) }))
     if let screen = NSScreen.main?.visibleFrame {
       panel.setFrameTopLeftPoint(NSPoint(x: screen.midX - 240, y: screen.maxY - 8))
     }
