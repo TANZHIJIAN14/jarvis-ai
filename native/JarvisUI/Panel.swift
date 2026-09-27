@@ -14,7 +14,9 @@ struct Panel: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
-      if model.state == "listening" && !model.followUp && model.thread.last?.reply.isEmpty != false && model.approval == nil {
+      if model.state == "listening" && !model.partial.isEmpty {
+        ListeningLine(words: model.partial)
+      } else if model.state == "listening" && !model.followUp && model.thread.last?.reply.isEmpty != false && model.approval == nil {
         ListeningLine()
       }
       ForEach(Array(model.thread.enumerated()), id: \.element.id) { index, exchange in
@@ -56,11 +58,17 @@ struct Panel: View {
   }
 }
 
+// "Listening…", then your words as they're recognised.
 private struct ListeningLine: View {
+  var words = ""
+
   var body: some View {
     HStack(alignment: .firstTextBaseline, spacing: 8) {
       Image(systemName: "mic").foregroundStyle(Theme.running)
-      Text("Listening…").font(.system(size: 17)).foregroundStyle(Theme.secondary)
+      Text(words.isEmpty ? "Listening…" : "\(words)…")
+        .font(.system(size: 17))
+        .foregroundStyle(words.isEmpty ? Theme.secondary : Theme.text)
+        .animation(.easeOut(duration: 0.15), value: words)
     }
   }
 }

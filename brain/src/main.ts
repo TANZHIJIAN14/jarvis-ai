@@ -80,9 +80,26 @@ const transcriber = new Transcriber({
   port: config.whisperPort,
   vocabulary: config.vocabulary,
 });
-const [wakeWord, vad] = await Promise.all([
+// Quitting while the models still load (or a crash) must not leave the Whisper servers running.
+process.on("exit", () => {
+  transcriber.stop();
+  partialTranscriber?.stop();
+});
+process.once("SIGINT", () => process.exit(0));
+process.once("SIGTERM", () => process.exit(0));
+
+// Live words while you speak, from a small model; Jarvis works without it.
+const partialModel = join(config.modelsDir, "ggml-base.en.bin");
+const partialTranscriber = config.partialsMs > 0 && existsSync(partialModel)
+  ? new Transcriber({ model: partialModel, language: config.language, port: config.whisperPort + 1, vocabulary: config.vocabulary, beam: false })
+  : undefined;
+const [wakeWord, vad, partialsReady] = await Promise.all([
   WakeWord.load(config.modelsDir),
   Vad.load(join(config.modelsDir, "silero_vad.onnx")),
+  partialTranscriber?.start().then(() => true, (err: Error) => {
+    log(dim(`Live words unavailable (${err.message}).`));
+    return false;
+  }),
   transcriber.start(),
 ]);
 // The Kokoro voice loads in the background (the first start downloads ~310 MB); until it's
@@ -166,6 +183,8 @@ const jarvis = new Jarvis({
   },
   bargeIn: config.echoCancel, // switched off below if the mic falls back to plain capture
   rules: new AllowRules(join(config.dataDir, "always-allow.json")),
+  partialTranscriber: partialsReady ? partialTranscriber : undefined,
+  partialsMs: config.partialsMs,
 });
 
 const token = randomBytes(16).toString("hex");
@@ -253,7 +272,10 @@ log(dim(mic.echoCancelling
 const keys = createInterface({ input: process.stdin });
 keys.on("line", () => (jarvis.state === "idle" ? jarvis.activate(false) : jarvis.stop()));
 keys.on("SIGINT", shutdown);
+process.removeAllListeners("SIGINT");
 process.on("SIGINT", shutdown);
+process.removeAllListeners("SIGTERM");
+process.on("SIGTERM", shutdown);
 
 // The neural voice; until it loads (or if it can't), the Apple voice speaks.
 async function loadKokoro(): Promise<void> {
@@ -406,6 +428,7 @@ function shutdown(): void {
   speaker.close();
   kokoro?.close();
   transcriber.stop();
+  partialTranscriber?.stop();
   uiApp?.kill();
   ui.close();
   process.exit(0);

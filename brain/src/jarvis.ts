@@ -27,6 +27,7 @@ export type UiEvent =
   | { type: "state"; state: JarvisState; followUp: boolean }
   | { type: "level"; value: number }
   | { type: "transcript"; text: string }
+  | { type: "partial_transcript"; text: string } // words appearing as you speak
   | { type: "reply_start" }
   | { type: "reply_delta"; text: string }
   | { type: "tool"; name: string; detail: string; activity: string }
@@ -132,6 +133,10 @@ export type JarvisDeps = {
 
   // Interrupt by talking over Jarvis. Needs echo cancellation, or Jarvis hears itself.
   bargeIn?: boolean;
+  // Live words while you speak: a small, fast Whisper (its own server, so the final transcript
+  // never waits behind it), and how often to ask it. Off without one.
+  partialTranscriber?: Pick<Transcriber, "transcribePcm">;
+  partialsMs?: number;
 };
 
 type Sound = "wake" | "done" | "error";
@@ -172,6 +177,8 @@ export class Jarvis {
   private rules: AllowRules;
   private failedRequest: { text: string; prompt: string } | undefined; // kept for Try again
   private taskNotBefore = new Map<number, number>(); // queued until a usage limit resets
+  private partials: ReturnType<typeof setInterval> | undefined;
+  private partialBusy = false;
   private changes = new Map<number, ChangeTracker>(); // per session: files touched, for task reports
 
   constructor(deps: JarvisDeps) {
@@ -838,11 +845,39 @@ ${text}`.trim());
     this.setState("idle");
   }
 
+  // Live words: while listening, transcribe what's been said so far every so often (one
+  // request at a time), and show it until the final transcript arrives.
+  private livePartials(on: boolean): void {
+    const every = this.deps.partialsMs ?? 0;
+    const transcriber = this.deps.partialTranscriber;
+    if (!on || every <= 0 || !transcriber) {
+      if (this.partials) clearInterval(this.partials);
+      this.partials = undefined;
+      return;
+    }
+    if (this.partials) return;
+    this.partials = setInterval(() => {
+      const audio = this.deps.listener.speechSoFar;
+      const gen = this.gen;
+      if (!audio || this.partialBusy) return;
+      this.partialBusy = true;
+      transcriber.transcribePcm(Buffer.from(audio.buffer, audio.byteOffset, audio.byteLength))
+        .then((text) => {
+          const words = stripWakePhrase(text);
+          if (words && gen === this.gen && (this.state === "listening" || this.state === "asking")) {
+            this.deps.emit({ type: "partial_transcript", text: words });
+          }
+        }, () => {})
+        .finally(() => (this.partialBusy = false));
+    }, every);
+  }
+
   private setState(state: JarvisState): void {
     if (state !== "listening") this.followUp = false;
     if (state === this.state && state !== "listening") return;
     this.state = state;
     this.deps.listener.watchForSpeech(this.bargeIn && state === "speaking");
+    this.livePartials(state === "listening" || state === "asking");
     this.deps.emit({ type: "state", state, followUp: this.followUp });
     if (state === "thinking" || state === "speaking" || state === "idle") void this.askNext();
   }

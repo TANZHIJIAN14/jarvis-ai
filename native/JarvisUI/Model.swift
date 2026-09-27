@@ -131,6 +131,7 @@ final class JarvisModel: ObservableObject {
   @Published var sessionTitle: String?
   @Published var thread: [Exchange] = [] // the current conversation, newest last (only the last two show)
   @Published var notice = ""
+  @Published var partial = "" // the words so far, while you speak
   @Published var approval: Approval?
   @Published var tasks: [Int: TaskItem] = [:]
   @Published var taskSteps: [Int: [TaskStep]] = [:] // the Agents window's activity lists
@@ -195,13 +196,17 @@ final class JarvisModel: ObservableObject {
       state = event["state"] as? String ?? "idle"
       followUp = event["followUp"] as? Bool ?? false
       if state != "error" { error = nil }
+      if state != "listening" && state != "asking" { partial = "" }
       if state == "listening" {
         listeningSince = Date()
         level = 0
       }
     case "level":
       level = event["value"] as? Double ?? 0
+    case "partial_transcript":
+      partial = event["text"] as? String ?? ""
     case "transcript":
+      partial = ""
       // A new exchange: what the user said, then Jarvis's reply below it.
       thread.append(Exchange(you: event["text"] as? String ?? ""))
       if thread.count > 2 { thread.removeFirst(thread.count - 2) }

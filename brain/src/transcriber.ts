@@ -11,9 +11,12 @@ export class Transcriber {
   private language: string;
   private port: number;
   private vocabulary: string;
+  private beam: boolean;
 
-  constructor(opts: { model: string; language: string; port: number; vocabulary: string }) {
+  // beam: false for the small live-words model, where speed matters more than the last word.
+  constructor(opts: { model: string; language: string; port: number; vocabulary: string; beam?: boolean }) {
     this.model = opts.model;
+    this.beam = opts.beam ?? true;
     this.language = opts.language;
     this.port = opts.port;
     this.vocabulary = opts.vocabulary;
@@ -24,11 +27,11 @@ export class Transcriber {
     if (!existsSync(this.model)) throw new Error(`Whisper model not found: ${this.model}`);
     const args = [
       "-m", this.model, "-l", this.language, "--host", "127.0.0.1", "--port", String(this.port),
-      // The server decodes greedily by default; beam search is noticeably more accurate.
-      "--beam-size", "5", "--best-of", "5",
       // Stops "[music]"-style tokens, a common source of made-up text on quiet audio.
       "--suppress-nst",
     ];
+    // The server decodes greedily by default; beam search is noticeably more accurate.
+    if (this.beam) args.push("--beam-size", "5", "--best-of", "5");
     // Whisper treats the prompt as preceding text, which nudges it toward these spellings.
     if (this.vocabulary) args.push("--prompt", this.vocabulary);
     this.proc = spawn("whisper-server", args, { stdio: "ignore" });

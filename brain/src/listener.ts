@@ -99,6 +99,11 @@ export class Listener {
     return this.capture !== undefined;
   }
 
+  // What's been said so far in this capture, once speech has started (for live words).
+  get speechSoFar(): Int16Array | undefined {
+    return this.capture?.started ? concatAll(this.capture.audio) : undefined;
+  }
+
   // Model calls are async; chunks are processed strictly in order.
   feed(samples: Int16Array): Promise<void> {
     this.queue = this.queue.then(() => this.process(samples));

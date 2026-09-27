@@ -49,6 +49,9 @@ export const config = {
   echoCancel: (env.JARVIS_ECHO_CANCEL ?? "1") !== "0",
   // Saves what the mic hears while Jarvis speaks (plus VAD scores) for tuning talk-over.
   debugAudio: env.JARVIS_DEBUG_AUDIO === "1",
+  // How often the words so far are shown while you speak (ms); 0 turns live words off.
+  // They come from a small Whisper model (scripts/fetch-models.sh) on the next port up.
+  partialsMs: Number(env.JARVIS_PARTIALS_MS ?? 600),
   // Local port the Jarvis UI connects to.
   uiPort: Number(env.JARVIS_UI_PORT ?? 8765),
 };

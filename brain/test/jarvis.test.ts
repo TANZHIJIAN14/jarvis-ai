@@ -44,7 +44,7 @@ function fakeSession() {
   return { session: session as unknown as ClaudeSession, turns, interrupts: () => interrupted };
 }
 
-function setup(transcripts: string[], opts: { bargeIn?: boolean; history?: HistoryStore } = {}) {
+function setup(transcripts: string[], opts: { bargeIn?: boolean; history?: HistoryStore; partialsMs?: number } = {}) {
   const events: UiEvent[] = [];
   const captures: CaptureOptions[] = [];
   const watching: boolean[] = [];
@@ -80,13 +80,16 @@ function setup(transcripts: string[], opts: { bargeIn?: boolean; history?: Histo
       startCapture: (o: CaptureOptions) => captures.push(o),
       stopCapture() {},
       watchForSpeech: (on: boolean) => watching.push(on),
+      speechSoFar: new Int16Array(16),
     } as unknown as Listener,
     transcriber: { transcribePcm: async () => transcripts.shift() ?? "" } as unknown as Transcriber,
+    partialTranscriber: { transcribePcm: async () => "Hey Jarvis, what's the" },
     speaker: speaker as unknown as Speaker,
     sessions,
     history,
     emit: (e) => events.push(e),
     bargeIn: opts.bargeIn,
+    partialsMs: opts.partialsMs,
   });
   const states = () => events.filter((e) => e.type === "state").map((e) => (e as { state: string }).state);
   return { jarvis, events, captures, spoken, claude, states, watching, history, claudeStarts, projectsDir, sounds };
@@ -621,4 +624,20 @@ test("a failed task is reported with the failing line and that no files changed"
   assert.equal(report.failed, true);
   assert.equal(report.error, "Error: npm test exited with code 1");
   assert.match(report.summary, /ran into a problem: Error: npm test exited with code 1\. No files were changed\./);
+});
+
+test("live words: while listening, the words so far appear; they stop once the request is heard", async () => {
+  const ctx = setup(["what's the weather"], { partialsMs: 5 });
+  ctx.jarvis.activate(true);
+  await new Promise((r) => setTimeout(r, 30));
+  const partial = ctx.events.find((e) => e.type === "partial_transcript") as { text: string };
+  assert.equal(partial.text, "what's the", "wake phrase stripped");
+  const reply = ctx.jarvis.onUtterance(new Int16Array(16));
+  await tick();
+  const count = ctx.events.filter((e) => e.type === "partial_transcript").length;
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(ctx.events.filter((e) => e.type === "partial_transcript").length, count, "none after listening ends");
+  ctx.claude.turns[0].finish({});
+  ctx.jarvis.stop();
+  await reply;
 });
