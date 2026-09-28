@@ -3,3 +3,4 @@ node_modules/
 *.wav
 native/bin/
 models/
+dist/

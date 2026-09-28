@@ -54,4 +54,7 @@ export const config = {
   partialsMs: Number(env.JARVIS_PARTIALS_MS ?? 600),
   // Local port the Jarvis UI connects to.
   uiPort: Number(env.JARVIS_UI_PORT ?? 8765),
+  // Set by Jarvis.app, which starts the brain: the UI's token, and not to launch another UI.
+  uiToken: env.JARVIS_UI_TOKEN,
+  app: env.JARVIS_APP === "1",
 };

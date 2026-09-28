@@ -12,6 +12,16 @@ All milestones in the design doc are built: hands-free voice turns, the Calm gla
 
 Requirements: macOS on Apple Silicon, Xcode command line tools (Swift), Node 23+, whisper.cpp (`brew install whisper-cpp`), OpenSuperWhisper's `ggml-large-v3-turbo.bin` model, and a logged-in `claude` CLI.
 
+### As a Mac app
+
+```bash
+cd brain && npm install && cd .. && scripts/build-app.sh --install
+```
+
+This builds `Jarvis.app` into `/Applications`. Open it from Spotlight or Finder: it lives in the menu bar, asks macOS for the microphone itself, and starts and looks after the brain (restarting it if it crashes). "Open at login" in Settings adds it as a login item; the brain's output goes to `~/Library/Application Support/Jarvis/jarvis.log` (menu bar → Open Log). The app has its own copy of the brain, so rebuild it after pulling changes. It still uses Node, `whisper-server` and `claude` from where they're installed. It's signed for this Mac only, so macOS asks for the microphone again after each rebuild.
+
+### From a terminal
+
 ```bash
 cd brain && npm install && npm start
 ```
@@ -61,6 +71,9 @@ The first start builds the Swift helpers and downloads the wake word and voice a
 | `brain/src/approval-server.ts`, `approval-mcp.ts`, `approvals.ts` | Voice approvals: Claude Code's permission prompts → a spoken yes/no question |
 | `brain/src/ui-server.ts` | Token-protected loopback WebSocket for the UI |
 | `native/JarvisUI/` | Calm glass UI (SwiftUI): orb, conversation panel, approval, error and report cards, menu bar icon, the Agents, History, Settings and first-run windows, the F5 push-to-talk key |
+| `native/JarvisUI/BrainProcess.swift` | Jarvis.app mode: starts the brain on free ports and restarts it if it crashes |
+| `scripts/build-app.sh`, `make-icon.swift` | Builds and signs `Jarvis.app` with its icon |
+| `brain/src/models.ts` | Downloads missing wake word, voice detection and live-words models on first start |
 | `native/mic-capture.swift` | Streams the default mic as 16 kHz PCM (AVAudioEngine), with Apple's echo cancellation |
 | `native/speak.swift` | Long-lived audio output helper: plays Kokoro audio or speaks with the system voice |
 | `brain/voice-rules.md` | System prompt addition that makes replies suitable for speech |

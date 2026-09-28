@@ -16,6 +16,7 @@ import { KokoroVoice } from "./kokoro.ts";
 import { DEFAULT_LISTENER_OPTIONS, Listener } from "./listener.ts";
 import { MicStream } from "./mic-stream.ts";
 import { claudeOneShot } from "./oneshot.ts";
+import { ensureModels } from "./models.ts";
 import { clearRecordings, claudeStatus, isOpenAtLogin, pruneRecordings, saveRecording, setOpenAtLogin } from "./mac.ts";
 import { SettingsStore, VOICES, type Settings } from "./settings.ts";
 import { voiceSynth } from "./voices.ts";
@@ -45,7 +46,7 @@ const settings = new SettingsStore(join(config.dataDir, "settings.json"), {
   pushToTalk: true,
   maxTasks: 3,
   model: config.model ?? "",
-  openAtLogin: isOpenAtLogin(),
+  openAtLogin: config.app ? false : isOpenAtLogin(),
   keepRecordings: false,
   projects: [],
   onboarded: existsSync(join(config.dataDir, "jarvis.sqlite")), // set up before Settings existed
@@ -64,11 +65,11 @@ function writeVoiceRules(): void {
 }
 writeVoiceRules();
 
-for (const model of ["melspectrogram.onnx", "embedding_model.onnx", "hey_jarvis.onnx", "silero_vad.onnx"]) {
-  if (!existsSync(join(config.modelsDir, model))) {
-    log(`Missing model ${model}. Run scripts/fetch-models.sh first.`);
-    process.exit(1);
-  }
+try {
+  await ensureModels(config.modelsDir, (line) => log(dim(line)));
+} catch (err) {
+  log((err as Error).message);
+  process.exit(1);
 }
 mkdirSync(config.workspace, { recursive: true });
 
@@ -187,7 +188,8 @@ const jarvis = new Jarvis({
   partialsMs: config.partialsMs,
 });
 
-const token = randomBytes(16).toString("hex");
+// Jarvis.app starts the brain and passes the UI's token; from a terminal, the brain makes one.
+const token = config.uiToken ?? randomBytes(16).toString("hex");
 const ui = new UiServer({
   port: config.uiPort,
   token,
@@ -319,7 +321,7 @@ function changeSettings(patch: Partial<Settings>): void {
     if (key === "sir") writeVoiceRules();
     if (key === "talkOver") jarvis.bargeIn = v.talkOver && mic.echoCancelling;
     if (key === "keepRecordings" && !v.keepRecordings) clearRecordings(recordingsDir);
-    if (key === "openAtLogin") {
+    if (key === "openAtLogin" && !config.app) { // Jarvis.app registers itself as a login item
       setOpenAtLogin(v.openAtLogin, {
         args: [process.execPath, "--experimental-strip-types", "--no-warnings=ExperimentalWarning", fileURLToPath(import.meta.url)],
         cwd: fileURLToPath(new URL("..", import.meta.url)),
@@ -369,6 +371,7 @@ function saveWatchDebug(): void {
 }
 
 function launchUi(): ChildProcess | undefined {
+  if (config.app) return undefined; // Jarvis.app is the UI, and started us
   if (!existsSync(UI_APP)) {
     log(dim("JarvisUI is not built (npm run build:native); running without the orb."));
     return undefined;
