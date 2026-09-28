@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { isKokoroVoice, SettingsStore, type Settings } from "../src/settings.ts";
 
 const defaults: Settings = {
-  voice: "bm_george", voiceSpeed: 1, sir: false, wakeThreshold: 0.5, talkOver: true, pushToTalk: false, maxTasks: 3,
+  voice: "bm_george", voiceSpeed: 1, sir: false, wakeThreshold: 0.5, talkOver: true, pushToTalk: false, maxTasks: 3, webWithoutAsking: true,
   model: "", openAtLogin: false, keepRecordings: false, projects: [], onboarded: false,
 };
 

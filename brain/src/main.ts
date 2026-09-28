@@ -45,6 +45,7 @@ const settings = new SettingsStore(join(config.dataDir, "settings.json"), {
   talkOver: config.echoCancel,
   pushToTalk: true,
   maxTasks: 3,
+  webWithoutAsking: true,
   model: config.model ?? "",
   openAtLogin: config.app ? false : isOpenAtLogin(),
   keepRecordings: false,
@@ -184,6 +185,7 @@ const jarvis = new Jarvis({
   },
   bargeIn: config.echoCancel, // switched off below if the mic falls back to plain capture
   rules: new AllowRules(join(config.dataDir, "always-allow.json")),
+  webWithoutAsking: () => settings.values.webWithoutAsking,
   partialTranscriber: partialsReady ? partialTranscriber : undefined,
   partialsMs: config.partialsMs,
 });

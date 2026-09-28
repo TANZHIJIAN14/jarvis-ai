@@ -12,6 +12,7 @@ export type Settings = {
   talkOver: boolean; // interrupt by talking (echo cancellation)
   pushToTalk: boolean; // hold F5 to talk
   maxTasks: number; // background tasks at once
+  webWithoutAsking: boolean; // web searches and reading web pages don't need an OK
   model: string; // "" = the claude CLI's default
   openAtLogin: boolean;
   keepRecordings: boolean; // 7 days, to check transcription mistakes
