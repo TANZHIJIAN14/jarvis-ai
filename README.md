@@ -12,6 +12,16 @@ All milestones in the design doc are built: hands-free voice turns, the Calm gla
 
 Requirements: macOS on Apple Silicon, Xcode command line tools (Swift), Node 23+, whisper.cpp (`brew install whisper-cpp`), OpenSuperWhisper's `ggml-large-v3-turbo.bin` model, and a logged-in `claude` CLI.
 
+### As a Mac app
+
+```bash
+cd brain && npm install && cd .. && scripts/build-app.sh --install
+```
+
+This builds `Jarvis.app` into `/Applications`. Open it from Spotlight or Finder: it lives in the menu bar, asks macOS for the microphone itself, and starts and looks after the brain (restarting it if it crashes). "Open at login" in Settings adds it as a login item; the brain's output goes to `~/Library/Application Support/Jarvis/jarvis.log` (menu bar → Open Log). The app has its own copy of the brain, so rebuild it after pulling changes. It still uses Node, `whisper-server` and `claude` from where they're installed. It's signed for this Mac only, so macOS asks for the microphone again after each rebuild.
+
+### From a terminal
+
 ```bash
 cd brain && npm install && npm start
 ```
@@ -21,7 +31,7 @@ The first start builds the Swift helpers and downloads the wake word and voice a
 - Say **"Hey Jarvis"** and your request in one breath, or pause after "Hey Jarvis" and then speak. Jarvis stops listening after 0.7 s of silence. Your words appear under the orb as you speak.
 - **Push to talk**: hold **F5** while you speak (for noisy rooms); releasing it ends the request.
 - After it answers, you have 8 seconds to reply without the wake word (the ring around the orb).
-- Jarvis works from your home folder: Claude can read any of your files and run read-only commands freely. Before it edits a file or runs anything else, Jarvis asks out loud ("May I run the tests in jarvis-ai?") and shows the exact command with Allow / Deny buttons. Say yes or no; silence means no. Commands that can't be undone (`git push`, `rm -r`, `git reset --hard`, `sudo`, …) need a click on Allow. **Always allow** (or "yes, always") saves a rule for that command, or for edits, in that folder; rules are listed in Settings → Background tasks.
+- Jarvis works from your home folder: Claude can read any of your files and run read-only commands freely. Before it edits a file or runs anything else, Jarvis asks out loud ("May I run the tests in jarvis-ai?") and shows the exact command with Allow / Deny buttons. Web searches and reading web pages go ahead without asking (Settings → Background tasks can turn that off). Say yes or no; silence means no. Commands that can't be undone (`git push`, `rm -r`, `git reset --hard`, `sudo`, …) need a click on Allow. **Always allow** (or "yes, always") saves a rule for that command, or for edits, in that folder; rules are listed in Settings → Background tasks.
 - **Agents window** (menu bar → Agents Window, or "Agents window" / "Details" in the panel): every background task with its request, activity, approvals and result. Start one without speaking (**New task…**, ⌘N, optionally in a project folder), send a note to a running task (it's interrupted and carries on with the note) or a follow-up to a finished one, **Stop** a task, or **Copy resume command** to continue it in the terminal. A finished task shows the files it changed and the diff. A fourth task waits until one of the three slots frees.
 - **History window** (menu bar → History, ⌘Y): past conversations by day and project, a search over everything said, summaries with open items in amber, and **Continue with Jarvis** (your next "Hey Jarvis" goes to that conversation).
 - **Settings** (menu bar → Settings…, ⌘,): voice with samples, speed, "call me sir", wake sensitivity, talk-over, push to talk, tasks at once, the model, open at login, Always allow rules, projects, 7-day recordings and Clear history. Saved in `~/Library/Application Support/Jarvis/settings.json`.
@@ -61,6 +71,9 @@ The first start builds the Swift helpers and downloads the wake word and voice a
 | `brain/src/approval-server.ts`, `approval-mcp.ts`, `approvals.ts` | Voice approvals: Claude Code's permission prompts → a spoken yes/no question |
 | `brain/src/ui-server.ts` | Token-protected loopback WebSocket for the UI |
 | `native/JarvisUI/` | Calm glass UI (SwiftUI): orb, conversation panel, approval, error and report cards, menu bar icon, the Agents, History, Settings and first-run windows, the F5 push-to-talk key |
+| `native/JarvisUI/BrainProcess.swift` | Jarvis.app mode: starts the brain on free ports and restarts it if it crashes |
+| `scripts/build-app.sh`, `make-icon.swift` | Builds and signs `Jarvis.app` with its icon |
+| `brain/src/models.ts` | Downloads missing wake word, voice detection and live-words models on first start |
 | `native/mic-capture.swift` | Streams the default mic as 16 kHz PCM (AVAudioEngine), with Apple's echo cancellation |
 | `native/speak.swift` | Long-lived audio output helper: plays Kokoro audio or speaks with the system voice |
 | `brain/voice-rules.md` | System prompt addition that makes replies suitable for speech |

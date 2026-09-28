@@ -44,7 +44,7 @@ function fakeSession() {
   return { session: session as unknown as ClaudeSession, turns, interrupts: () => interrupted };
 }
 
-function setup(transcripts: string[], opts: { bargeIn?: boolean; history?: HistoryStore; partialsMs?: number } = {}) {
+function setup(transcripts: string[], opts: { bargeIn?: boolean; history?: HistoryStore; partialsMs?: number; web?: boolean } = {}) {
   const events: UiEvent[] = [];
   const captures: CaptureOptions[] = [];
   const watching: boolean[] = [];
@@ -90,6 +90,7 @@ function setup(transcripts: string[], opts: { bargeIn?: boolean; history?: Histo
     emit: (e) => events.push(e),
     bargeIn: opts.bargeIn,
     partialsMs: opts.partialsMs,
+    webWithoutAsking: () => opts.web ?? false,
   });
   const states = () => events.filter((e) => e.type === "state").map((e) => (e as { state: string }).state);
   return { jarvis, events, captures, spoken, claude, states, watching, history, claudeStarts, projectsDir, sounds };
@@ -640,4 +641,16 @@ test("live words: while listening, the words so far appear; they stop once the r
   ctx.claude.turns[0].finish({});
   ctx.jarvis.stop();
   await reply;
+});
+
+test("web searches and pages can go through without asking; edits still ask", async () => {
+  const ctx = setup([], { web: true });
+  assert.equal((await ctx.jarvis.requestApproval({ sessionId: 1, toolName: "WebSearch", input: { query: "f1 calendar" } })).behavior, "allow");
+  assert.equal((await ctx.jarvis.requestApproval({ sessionId: 1, toolName: "WebFetch", input: { url: "https://f1.com" } })).behavior, "allow");
+  assert.equal(ctx.events.filter((e) => e.type === "approval").length, 0, "not asked");
+  const edit = ctx.jarvis.requestApproval({ sessionId: 1, toolName: "Edit", input: { file_path: "/x/a.ts" } });
+  await tick();
+  assert.equal(ctx.events.filter((e) => e.type === "approval").length, 1, "edits still ask");
+  ctx.jarvis.stop();
+  await edit;
 });

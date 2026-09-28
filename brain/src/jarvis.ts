@@ -130,6 +130,7 @@ export type JarvisDeps = {
   // "wake": Jarvis is listening; "done": a background task finished (its report waits for the next wake).
   sound?: (name: Sound) => void;
   rules?: AllowRules; // "Always allow" answers; in memory when absent
+  webWithoutAsking?: () => boolean; // Settings: searching and reading the web only reads, so skip the question
 
   // Interrupt by talking over Jarvis. Needs echo cancellation, or Jarvis hears itself.
   bargeIn?: boolean;
@@ -497,7 +498,10 @@ export class Jarvis {
   requestApproval(request: ApprovalRequest): Promise<ApprovalDecision> {
     const record = this.deps.history.get(request.sessionId);
     const cwd = record?.cwd ?? this.deps.sessions.defaultCwd;
-    if (this.rules.allows(request, cwd)) return Promise.resolve({ behavior: "allow", updatedInput: request.input });
+    const web = request.toolName === "WebSearch" || request.toolName === "WebFetch";
+    if (this.rules.allows(request, cwd) || (web && this.deps.webWithoutAsking?.())) {
+      return Promise.resolve({ behavior: "allow", updatedInput: request.input });
+    }
     return new Promise((resolve) => {
       const { question, detail } = describeRequest(request);
       const background = this.deps.sessions.isBackground(request.sessionId);

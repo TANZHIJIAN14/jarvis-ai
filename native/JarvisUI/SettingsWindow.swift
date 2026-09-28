@@ -306,7 +306,14 @@ private struct TasksTab: View {
       Text("What tasks may do without asking").font(.system(size: 13, weight: .semibold))
       ListBox {
         ListRow { Text("Read files and run read-only commands"); Spacer(); Text("Allowed").foregroundStyle(Theme.done) }
-        ListRow { Text("Edit files, other commands and the web"); Spacer(); Text("Asks you first").foregroundStyle(Theme.needsYouText) }
+        ListRow {
+          Text("Search the web and read web pages")
+          Spacer()
+          let web = model.setting("webWithoutAsking", true)
+          Text(web ? "Allowed" : "Asks you first").foregroundStyle(web ? Theme.done : Theme.needsYouText)
+          Toggle("", isOn: binding(model, send, "webWithoutAsking", true)).toggleStyle(.switch).labelsHidden().controlSize(.small)
+        }
+        ListRow { Text("Edit files and run other commands"); Spacer(); Text("Asks you first").foregroundStyle(Theme.needsYouText) }
         ListRow(last: true) { Text("Deleting, git push, sudo"); Spacer(); Text("Asks, and needs a click").foregroundStyle(Theme.failed) }
       }
       if model.rules.isEmpty {

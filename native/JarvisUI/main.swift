@@ -5,9 +5,11 @@
 // Build: npm run build:native (in brain/)
 // Run:   bin/JarvisUI --port 8765 --token <token>   (the brain launches it; --open-agents, --open-history,
 //        --open-settings and --onboarding open those windows, for development)
+// As Jarvis.app (scripts/build-app.sh), there's no --port: the app starts the brain itself.
 
 import AppKit
 import Combine
+import ServiceManagement
 import SwiftUI
 
 func argument(_ name: String) -> String? {
@@ -61,6 +63,7 @@ struct JarvisView: View {
 final class AppDelegate: NSObject, NSApplicationDelegate {
   let model = JarvisModel()
   var brain: BrainConnection!
+  var brainProcess: BrainProcess? // Jarvis.app: the brain we started
   var agents: AgentsWindowController!
   var history: HistoryWindowController!
   var settings: SettingsWindowController!
@@ -73,7 +76,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   var observers = Set<AnyCancellable>()
 
   func applicationDidFinishLaunching(_ notification: Notification) {
-    brain = BrainConnection(port: argument("--port") ?? "8765", token: argument("--token") ?? "", model: model)
+    if argument("--port") == nil, let process = BrainProcess() {
+      brainProcess = process
+      process.onGaveUp = { [weak self] message in
+        self?.model.notice = message
+        self?.showPanel()
+      }
+      process.start()
+    }
+    brain = BrainConnection(port: brainProcess?.port ?? argument("--port") ?? "8765",
+                            token: brainProcess?.token ?? argument("--token") ?? "", model: model)
     agents = AgentsWindowController(model: model) { [weak self] command in self?.brain.send(command) }
     settings = SettingsWindowController(model: model) { [weak self] command in self?.brain.send(command) }
     onboarding = OnboardingWindowController(model: model) { [weak self] command in self?.brain.send(command) }
@@ -81,6 +93,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     model.$settings.receive(on: RunLoop.main).sink { [weak self] _ in
       guard let self, self.model.settingsLoaded else { return }
       self.pushToTalk.setEnabled(self.model.setting("pushToTalk", true))
+      if self.brainProcess != nil { self.setLoginItem(self.model.setting("openAtLogin", false)) }
     }.store(in: &observers)
     history = HistoryWindowController(model: model, send: { [weak self] command in self?.brain.send(command) },
                                       openAgents: { [weak self] id in self?.agents.show(selecting: id) })
@@ -139,6 +152,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     settingsItem.target = self
     menu.addItem(settingsItem)
     menu.addItem(.separator())
+    if brainProcess != nil {
+      menu.addItem(withTitle: "Open Log", action: #selector(openLog), keyEquivalent: "").target = self
+    }
     menu.addItem(withTitle: "Quit Jarvis", action: #selector(quit), keyEquivalent: "q").target = self
     statusItem.menu = menu
   }
@@ -210,8 +226,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   @objc func openSettings() { settings.show() }
   @objc private func stop() { brain.send(["type": "stop"]) }
   @objc private func quit() {
+    brainProcess?.stop() // it stops whisper-server and Claude on the way out
     brain.send(["type": "quit"])
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { NSApp.terminate(nil) }
+  }
+
+  @objc private func openLog() { NSWorkspace.shared.open(BrainProcess.logFile) }
+
+  func applicationWillTerminate(_ notification: Notification) {
+    brainProcess?.stop()
+  }
+
+  // Settings → Open at login, for Jarvis.app: a login item for the app itself.
+  private func setLoginItem(_ on: Bool) {
+    let service = SMAppService.mainApp
+    if on && service.status != .enabled { try? service.register() }
+    if !on && service.status == .enabled { try? service.unregister() }
   }
 }
 
