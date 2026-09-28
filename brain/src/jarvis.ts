@@ -3,8 +3,12 @@ import { basename } from "node:path";
 import type { ApprovalDecision, ApprovalRequest } from "./approval-server.ts";
 import { describeActivity } from "./activity.ts";
 import { describeRequest, isDestructive, parseAnswer } from "./approvals.ts";
+import { ChangeTracker, spokenChanges, type FileChange } from "./changes.ts";
+import { classifyClaudeError, unreachableMessage, type ClaudeProblem } from "./errors.ts";
 import { parseCommand } from "./commands.ts";
 import type { HistoryStore } from "./history.ts";
+import { AllowRules, describeRule, ruleFor, type AllowRule } from "./rules.ts";
+import type { Settings, VOICES } from "./settings.ts";
 import type { CaptureOptions, Listener } from "./listener.ts";
 import { SentenceSplitter } from "./sentences.ts";
 import type { SessionManager } from "./sessions.ts";
@@ -15,27 +19,51 @@ import type { Transcriber } from "./transcriber.ts";
 // Every activation bumps `gen`; async work from an older generation drops its result,
 // which is how "Hey Jarvis" or a click interrupts whatever Jarvis was doing.
 
-export type JarvisState = "idle" | "listening" | "transcribing" | "thinking" | "speaking" | "asking";
+// "error": Claude can't be reached; the question is kept for Try again.
+export type JarvisState = "idle" | "listening" | "transcribing" | "thinking" | "speaking" | "asking" | "error";
 
 // Brain -> UI messages. native/JarvisUI.swift decodes the same shapes.
 export type UiEvent =
   | { type: "state"; state: JarvisState; followUp: boolean }
   | { type: "level"; value: number }
   | { type: "transcript"; text: string }
+  | { type: "partial_transcript"; text: string } // words appearing as you speak
   | { type: "reply_start" }
   | { type: "reply_delta"; text: string }
   | { type: "tool"; name: string; detail: string; activity: string }
   | { type: "reply_done"; error?: string }
   | { type: "notice"; text: string }
   | { type: "session"; id: number; title: string | null; project: string }
-  | { type: "approval"; id: number; question: string; detail: string; destructive: boolean; taskId?: number }
+  // `always`: what "Always allow" would save ("Run “npm test” in jarvis-ai"); absent when not offered.
+  | { type: "approval"; id: number; question: string; detail: string; destructive: boolean; taskId?: number; always?: string }
   | { type: "approval_done"; id: number; allowed: boolean }
   // A background task (its id is its session's id). `reported`: its result has been told to the user.
   | { type: "task"; id: number; title: string; project: string; status: TaskStatus; activity: string;
       startedAt: number; reported: boolean; request: string; origin: "voice" | "window"; cwd: string;
       claudeSessionId: string | null }
   | { type: "task_step"; taskId: number; tool: string; detail: string; at: number }
-  | { type: "task_report"; taskId: number; title: string; summary: string };
+  | { type: "task_report"; taskId: number; title: string; summary: string; files: FileChange[]; diff: string;
+      failed: boolean; error?: string }
+  // Claude can't be reached (the red Error state): what to say, and the command that fixes it.
+  | { type: "error"; reason: Extract<ClaudeProblem, { kind: "unreachable" }>["reason"]; text: string; command: string }
+  // Settings and first-run setup.
+  | { type: "settings"; values: Settings; locked: Array<keyof Settings>; voices: typeof VOICES;
+      projects: Array<{ path: string; kind: string }>; permissionMode: string; dataDir: string }
+  | { type: "claude_status"; installed: boolean; version?: string; loggedIn: boolean; plan?: string }
+  | { type: "models"; whisper: boolean; kokoro: { loaded: number; total: number; done: boolean; failed: boolean } }
+  | { type: "mic_status"; ok: boolean }
+  // Saved "Always allow" rules, for Settings.
+  | { type: "rules"; rules: Array<{ label: string; folder: string }> }
+  // The History window: a search's results, and one conversation opened.
+  | { type: "history_results"; query: string; project: string | null; projects: string[]; sessions: HistoryItem[] }
+  | { type: "history_detail"; id: number; turns: Array<{ at: number; user: string; reply: string; tools: string[] }> };
+
+export type HistoryItem = {
+  id: number; title: string | null; summary: string | null; project: string; cwd: string; startedAt: number;
+  lastActiveAt: number; turns: number; claudeSessionId: string | null;
+  current: boolean; // the conversation the next "Hey Jarvis" goes to
+  task: boolean; // a background task: opens in the Agents window
+};
 
 export type TaskStatus = "queued" | "running" | "done" | "failed" | "stopped";
 type TaskEvent = Extract<UiEvent, { type: "task" }>;
@@ -45,17 +73,31 @@ export type UiCommand =
   | { type: "activate" }
   | { type: "stop" }
   | { type: "quit" }
-  | { type: "approve"; id: number; allow: boolean }
+  | { type: "approve"; id: number; allow: boolean; always?: boolean }
+  | { type: "rule_remove"; index: number }
+  | { type: "retry" } // Try again, from the Error state
+  | { type: "ptt"; down: boolean } // push to talk: F5 pressed or released
+  | { type: "settings_set"; values: Partial<Settings> }
+  | { type: "voice_sample"; voice: string }
+  | { type: "claude_check" }
+  | { type: "mic_check" }
+  | { type: "history_clear" }
   | { type: "report_seen"; taskId: number }
   // The Agents window: start, steer and stop background tasks without speaking.
   | { type: "task_new"; text: string; project?: string }
   | { type: "task_note"; taskId: number; text: string }
-  | { type: "task_stop"; taskId: number };
+  | { type: "task_stop"; taskId: number }
+  // The History window: search, open a conversation, and make it the one "Hey Jarvis" continues.
+  | { type: "history_query"; query: string; project?: string }
+  | { type: "history_open"; id: number }
+  | { type: "history_continue"; id: number };
 
 const WAKE_CAPTURE: CaptureOptions = { preRollMs: 1500, noSpeechTimeoutMs: 5000 };
 const CLICK_CAPTURE: CaptureOptions = { preRollMs: 200, noSpeechTimeoutMs: 6000 };
 const FOLLOW_UP_CAPTURE: CaptureOptions = { preRollMs: 300, noSpeechTimeoutMs: 8000 };
 const ANSWER_CAPTURE: CaptureOptions = { preRollMs: 300, noSpeechTimeoutMs: 10_000 };
+// Push to talk: listens for as long as the key is held.
+const HELD_CAPTURE: CaptureOptions = { preRollMs: 150, noSpeechTimeoutMs: 60_000, held: true };
 // Talking over Jarvis: the words that triggered it are already in the pre-roll.
 const BARGE_IN_CAPTURE: CaptureOptions = { preRollMs: 800, noSpeechTimeoutMs: 3000, speechStarted: true };
 // An utterance made only of these (with at least one STOP_WORD) means "stop talking",
@@ -86,11 +128,18 @@ export type JarvisDeps = {
   history: HistoryStore;
   emit: (event: UiEvent) => void;
   // "wake": Jarvis is listening; "done": a background task finished (its report waits for the next wake).
-  sound?: (name: "wake" | "done") => void;
+  sound?: (name: Sound) => void;
+  rules?: AllowRules; // "Always allow" answers; in memory when absent
 
   // Interrupt by talking over Jarvis. Needs echo cancellation, or Jarvis hears itself.
   bargeIn?: boolean;
+  // Live words while you speak: a small, fast Whisper (its own server, so the final transcript
+  // never waits behind it), and how often to ask it. Off without one.
+  partialTranscriber?: Pick<Transcriber, "transcribePcm">;
+  partialsMs?: number;
 };
+
+type Sound = "wake" | "done" | "error";
 
 type Approval = {
   id: number;
@@ -99,6 +148,7 @@ type Approval = {
   detail: string;
   destructive: boolean; // needs a click, not a spoken yes
   taskId?: number;
+  rule?: AllowRule; // what "Always allow" saves
   retries: number;
   resolve: (decision: ApprovalDecision) => void;
 };
@@ -124,10 +174,17 @@ export class Jarvis {
   private approvals: Array<Approval> = [];
   private asking: Approval | undefined;
   private nextApprovalId = 1;
+  private rules: AllowRules;
+  private failedRequest: { text: string; prompt: string } | undefined; // kept for Try again
+  private taskNotBefore = new Map<number, number>(); // queued until a usage limit resets
+  private partials: ReturnType<typeof setInterval> | undefined;
+  private partialBusy = false;
+  private changes = new Map<number, ChangeTracker>(); // per session: files touched, for task reports
 
   constructor(deps: JarvisDeps) {
     this.deps = deps;
     this.bargeIn = deps.bargeIn ?? false;
+    this.rules = deps.rules ?? new AllowRules();
   }
 
   // "Hey Jarvis" or a click on the orb: stop talking and listen.
@@ -140,6 +197,22 @@ export class Jarvis {
       return;
     }
     this.listen(byVoice ? WAKE_CAPTURE : CLICK_CAPTURE, false);
+  }
+
+  // Push to talk (hold F5): listen while the key is down; releasing it ends what you said.
+  pushToTalk(down: boolean): void {
+    if (!down) {
+      if (this.state === "listening" || this.state === "asking") this.deps.listener.finishCapture();
+      return;
+    }
+    if (this.asking) {
+      this.listen(HELD_CAPTURE, false, "asking");
+      return;
+    }
+    this.holdReply();
+    this.gen++;
+    this.sound("wake");
+    this.listen(HELD_CAPTURE, false);
   }
 
   // Finished background work is told first on the next wake: "Quick update first: …".
@@ -189,7 +262,10 @@ export class Jarvis {
       this.answer(false, "The user didn't answer, so this was not approved.");
       return;
     }
-    if (!this.followUp) this.deps.emit({ type: "notice", text: "Didn't hear anything" });
+    if (!this.followUp) {
+      this.deps.emit({ type: "notice", text: "Didn't catch that" });
+      this.deps.speaker.say("I didn't catch that.");
+    }
     this.resolveHold(); // woke Jarvis, then said nothing: treat it as "stop"
     this.setState("idle");
   }
@@ -215,7 +291,7 @@ export class Jarvis {
       if (verdict === "yes" && this.asking.destructive) {
         return this.askAgain("That one can't be undone, so please click Allow if you're sure.");
       }
-      if (verdict) return this.answer(verdict === "yes");
+      if (verdict) return this.answer(verdict === "yes", undefined, verdict === "yes" && /\balways\b/i.test(text));
       if (this.asking.retries++ === 0) return this.askAgain("Sorry, was that a yes or a no?");
       return this.answer(false, `The user replied "${text}", which wasn't a clear yes.`);
     }
@@ -245,7 +321,8 @@ export class Jarvis {
         if (detached) return this.say("Okay, I'll keep working on that and let you know when it's done.", gen);
         if (sessions.claude?.busy) {
           this.resolveHold();
-          return this.say("I can only run three things at once, so I've stopped that one.", gen);
+          const most = ["no", "one", "two", "three", "four"][sessions.maxBackground] ?? String(sessions.maxBackground);
+          return this.say(`I can only run ${most} ${sessions.maxBackground === 1 ? "thing" : "things"} at once, so I've stopped that one.`, gen);
         }
         // Nothing was running: "keep going" is a normal request ("keep going with the story").
       }
@@ -316,6 +393,8 @@ export class Jarvis {
     const { speaker, emit, sessions } = this.deps;
     const session = sessions.forTurn();
     const sessionId = sessions.record!.id;
+    const changes = new ChangeTracker(sessions.record!.cwd);
+    this.changes.set(sessionId, changes); // carried into a task if this turn moves to the background
     const splitter = new SentenceSplitter();
     let replyText = "";
     const tools: string[] = [];
@@ -335,6 +414,7 @@ export class Jarvis {
       },
       onTool: (name, input) => {
         tools.push(`${name} ${toolDetail(input)}`.trim());
+        changes.onTool(name, input);
         const activity = describeActivity(name, input);
         if (sessions.isBackground(sessionId)) {
           this.taskStep(sessionId, name, input);
@@ -350,17 +430,17 @@ export class Jarvis {
       sessions.recordTurn(sessionId, text, replyText.trim(), tools, result.sessionId);
     }
     if (sessions.isBackground(sessionId)) {
-      this.afterBackgroundTurn(sessionId, replyText, result.isError && !result.interrupted);
+      this.afterBackgroundTurn(sessionId, replyText, result.isError && !result.interrupted, result.text);
       return;
     }
     if (gen !== this.gen) return;
 
     for (const sentence of splitter.flush()) speaker.say(sentence);
     if (result.isError && !result.interrupted) {
-      emit({ type: "reply_done", error: result.text });
-      speaker.say(/auth|log ?in/i.test(result.text)
-        ? "I can't reach Claude. Please log in to Claude Code again."
-        : "Sorry, something went wrong.");
+      const problem = classifyClaudeError(result.text);
+      if (problem.kind === "unreachable") return this.unreachable(problem.reason, text, prompt);
+      emit({ type: "reply_done", error: problem.kind === "limit" ? undefined : result.text });
+      speaker.say(problem.kind === "limit" ? this.limitReached(problem, prompt) : "Sorry, something went wrong.");
     } else {
       emit({ type: "reply_done" });
     }
@@ -374,6 +454,39 @@ export class Jarvis {
     }
   }
 
+  // The red Error state: say what's wrong once, with a low tone, and keep the question for Try again.
+  private async unreachable(reason: Extract<ClaudeProblem, { kind: "unreachable" }>["reason"], text: string,
+                            prompt: string): Promise<void> {
+    const { speaker, emit } = this.deps;
+    this.failedRequest = { text, prompt };
+    emit({ type: "reply_done" });
+    speaker.onFirstAudio = undefined;
+    this.sound("error");
+    this.setState("error");
+    const message = unreachableMessage(reason);
+    emit({ type: "error", reason, text: message, command: "claude" });
+    speaker.say(message);
+    await speaker.idle();
+  }
+
+  // Try again: asks the kept question once more.
+  retry(): void {
+    const failed = this.failedRequest;
+    if (!failed || this.state !== "error") return;
+    this.failedRequest = undefined;
+    this.deps.speaker.stop();
+    const gen = ++this.gen;
+    void this.reply(failed.text, gen, failed.prompt);
+  }
+
+  // A usage limit is an ordinary reply: say so, and queue the request as a task for when it resets.
+  private limitReached(problem: Extract<ClaudeProblem, { kind: "limit" }>, prompt: string): string {
+    if (!problem.resetAt) return "You've reached your Claude usage limit, so I can't do that right now. Please ask again once it resets.";
+    this.startTask(prompt, undefined, { cwd: this.deps.sessions.record?.cwd, notBefore: problem.resetAt + 60_000,
+      waiting: `Starts after the usage limit resets at ${problem.resetText}` });
+    return `You've reached your Claude usage limit. It resets at ${problem.resetText}, so I'll do this in the background then.`;
+  }
+
   private listen(opts: CaptureOptions, followUp: boolean, state: JarvisState = "listening"): void {
     this.followUp = followUp;
     this.deps.listener.startCapture(opts);
@@ -382,10 +495,13 @@ export class Jarvis {
 
   // Called (via the approval server) when Claude needs permission for an edit or a command.
   requestApproval(request: ApprovalRequest): Promise<ApprovalDecision> {
+    const record = this.deps.history.get(request.sessionId);
+    const cwd = record?.cwd ?? this.deps.sessions.defaultCwd;
+    if (this.rules.allows(request, cwd)) return Promise.resolve({ behavior: "allow", updatedInput: request.input });
     return new Promise((resolve) => {
       const { question, detail } = describeRequest(request);
       const background = this.deps.sessions.isBackground(request.sessionId);
-      const title = this.deps.history.get(request.sessionId)?.title;
+      const title = record?.title;
       this.approvals.push({
         id: this.nextApprovalId++,
         request,
@@ -393,6 +509,7 @@ export class Jarvis {
         detail,
         destructive: isDestructive(request),
         taskId: background ? request.sessionId : undefined,
+        rule: ruleFor(request, cwd),
         retries: 0,
         resolve,
       });
@@ -401,8 +518,21 @@ export class Jarvis {
   }
 
   // An answer clicked on the orb.
-  answerFromUi(id: number, allow: boolean): void {
-    if (this.asking?.id === id) this.answer(allow);
+  answerFromUi(id: number, allow: boolean, always = false): void {
+    if (this.asking?.id === id) this.answer(allow, undefined, always);
+  }
+
+  // Settings: the saved "Always allow" rules.
+  rulesEvent(): UiEvent {
+    return {
+      type: "rules",
+      rules: this.rules.rules.map((rule) => ({ label: describeRule(rule), folder: rule.cwd })),
+    };
+  }
+
+  removeRule(index: number): void {
+    this.rules.remove(index);
+    this.deps.emit(this.rulesEvent());
   }
 
   private async askNext(): Promise<void> {
@@ -419,6 +549,7 @@ export class Jarvis {
       detail: approval.detail,
       destructive: approval.destructive,
       taskId: approval.taskId,
+      always: approval.rule && `${describeRule(approval.rule)} in ${basename(approval.rule.cwd) || approval.rule.cwd}`,
     });
     await this.askAgain(approval.question);
   }
@@ -430,10 +561,14 @@ export class Jarvis {
     if (this.asking === approval) this.listen(ANSWER_CAPTURE, false, "asking");
   }
 
-  private answer(allow: boolean, reason = "The user said no."): void {
+  private answer(allow: boolean, reason = "The user said no.", always = false): void {
     const approval = this.asking;
     if (!approval) return;
     this.asking = undefined;
+    if (allow && always && approval.rule) {
+      this.rules.add(approval.rule);
+      this.deps.emit(this.rulesEvent());
+    }
     this.deps.listener.stopCapture();
     approval.resolve(allow
       ? { behavior: "allow", updatedInput: approval.request.input }
@@ -509,13 +644,48 @@ export class Jarvis {
     this.deps.emit(updated);
   }
 
+  // --- The History window ---
+
+  historyQuery(query: string, project?: string): void {
+    const { history, sessions } = this.deps;
+    const current = sessions.record?.id;
+    this.deps.emit({
+      type: "history_results",
+      query,
+      project: project ?? null,
+      projects: history.projects(),
+      sessions: history.search(query, { project }).map((s) => ({
+        ...s,
+        current: s.id === current,
+        task: this.tasks.has(s.id),
+      })),
+    });
+  }
+
+  historyOpen(id: number): void {
+    this.deps.emit({ type: "history_detail", id, turns: this.deps.history.transcript(id) });
+  }
+
+  // "Continue with Jarvis": the next "Hey Jarvis" goes to that conversation.
+  historyContinue(id: number): void {
+    const { history, sessions, emit } = this.deps;
+    const record = history.get(id);
+    if (!record) return;
+    if (sessions.isBackground(id)) {
+      emit({ type: "notice", text: "That one is still working in the background." });
+      return;
+    }
+    if (sessions.record?.id !== id) sessions.resume(record);
+    emit({ type: "notice", text: `Your next “Hey Jarvis” continues “${record.title ?? record.project}”.` });
+  }
+
   // --- Background tasks started, steered and stopped from the Agents window ---
 
   // "New task…": runs in the background, in the named project folder if one matches.
   // Queued when all background slots are busy. Returns the task's id.
-  startTask(text: string, project?: string): number {
+  startTask(text: string, project?: string, opts: { cwd?: string; notBefore?: number; waiting?: string } = {}): number {
     const { sessions, history } = this.deps;
-    const cwd = (project && sessions.findProject(project)) || sessions.defaultCwd;
+    const cwd = opts.cwd ?? ((project && sessions.findProject(project)) || sessions.defaultCwd);
     const record = history.createSession(cwd, basename(cwd));
     this.tasks.set(record.id, {
       type: "task",
@@ -523,15 +693,19 @@ export class Jarvis {
       title: titleFrom(text),
       project: record.project,
       status: "queued",
-      activity: "",
+      activity: opts.waiting ?? "",
       startedAt: Date.now(),
       reported: false,
       request: text,
-      origin: "window",
+      origin: opts.notBefore ? "voice" : "window",
       cwd,
       claudeSessionId: null,
     });
     this.taskPrompts.set(record.id, text);
+    if (opts.notBefore) {
+      this.taskNotBefore.set(record.id, opts.notBefore);
+      setTimeout(() => this.startQueued(), Math.max(0, opts.notBefore - Date.now())).unref();
+    }
     this.deps.emit(this.tasks.get(record.id)!);
     this.startQueued();
     return record.id;
@@ -576,12 +750,15 @@ ${text}`.trim());
     const { sessions, history } = this.deps;
     for (const task of [...this.tasks.values()]) {
       if (task.status !== "queued" || !sessions.canStartBackground()) continue;
+      if ((this.taskNotBefore.get(task.id) ?? 0) > Date.now()) continue;
+      this.taskNotBefore.delete(task.id);
       const record = history.get(task.id);
       const prompt = this.taskPrompts.get(task.id);
       if (!record || prompt === undefined) continue;
       this.taskPrompts.delete(task.id);
       sessions.startBackground(record.cwd, record.turns > 0 ? record : { ...record, claudeSessionId: null });
-      this.updateTask(task.id, { status: "running", startedAt: Date.now() });
+      this.changes.set(task.id, new ChangeTracker(record.cwd));
+      this.updateTask(task.id, { status: "running", startedAt: Date.now(), activity: "" });
       void this.runTaskTurn(task.id, prompt, prompt);
     }
   }
@@ -597,15 +774,16 @@ ${text}`.trim());
       onText: (delta) => (replyText += delta),
       onTool: (name, input) => {
         tools.push(`${name} ${toolDetail(input)}`.trim());
+        this.changes.get(id)?.onTool(name, input);
         this.taskStep(id, name, input);
       },
     });
     if (!result.isError || result.interrupted) sessions.recordTurn(id, userText, replyText.trim(), tools, result.sessionId);
-    this.afterBackgroundTurn(id, replyText, result.isError && !result.interrupted);
+    this.afterBackgroundTurn(id, replyText, result.isError && !result.interrupted, result.text);
   }
 
   // A background turn ended: stop it, carry on with a note, or finish and report.
-  private afterBackgroundTurn(id: number, reply: string, failed: boolean): void {
+  private afterBackgroundTurn(id: number, reply: string, failed: boolean, error = ""): void {
     const control = this.taskControl.get(id);
     this.taskControl.delete(id);
     if (control?.stop) {
@@ -616,7 +794,7 @@ ${text}`.trim());
       void this.runTaskTurn(id, `A note from the user while you were working: ${note}\nTake it into account and carry on.`, note);
       return;
     } else {
-      this.backgroundDone(id, reply, failed);
+      this.backgroundDone(id, reply, failed, error);
     }
     this.startQueued();
   }
@@ -636,20 +814,29 @@ ${text}`.trim());
     });
   }
 
-  private backgroundDone(sessionId: number, reply: string, failed: boolean): void {
+  private backgroundDone(sessionId: number, reply: string, failed: boolean, error = ""): void {
     const { sessions, history, emit } = this.deps;
     sessions.finishBackground(sessionId);
     const name = history.get(sessionId)?.title ?? "your earlier request";
     const first = new SentenceSplitter();
     const lead = [...first.push(reply), ...first.flush()][0] ?? "";
-    const text = failed ? `${name} ran into a problem, and nothing was changed after that.` : `Finished ${name}. ${lead}`.trim();
+    const tracker = this.changes.get(sessionId);
+    this.changes.delete(sessionId);
+    const { files, diff } = tracker?.collect() ?? { files: [], diff: "" };
+    const changed = tracker && tracker.touched > 0 ? ` ${spokenChanges(files)}` : "";
+    // A failed task: what failed, whether anything changed, and the failing line.
+    const failingLine = (error || reply).split("\n").map((l) => l.trim()).filter(Boolean).at(-1)?.slice(0, 200);
+    const text = failed
+      ? `${name} ran into a problem${failingLine ? `: ${failingLine.replace(/\.$/, "")}` : ""}.${files.length > 0 ? changed : " No files were changed."}`
+      : `Finished ${name}. ${lead}${changed}`.replace(/\s+/g, " ").trim();
     this.updateTask(sessionId, { status: failed ? "failed" : "done", activity: "" });
-    emit({ type: "task_report", taskId: sessionId, title: name, summary: reply.trim() || text });
+    emit({ type: "task_report", taskId: sessionId, title: name, summary: failed ? text : reply.trim() || text, files, diff,
+      failed, ...(failed && failingLine ? { error: failingLine } : {}) });
     this.unreported.push({ taskId: sessionId, text });
     this.sound("done"); // the report waits for the next "Hey Jarvis"
   }
 
-  private sound(name: "wake" | "done"): void {
+  private sound(name: Sound): void {
     (this.deps.sound ?? playSound)(name);
   }
 
@@ -658,11 +845,39 @@ ${text}`.trim());
     this.setState("idle");
   }
 
+  // Live words: while listening, transcribe what's been said so far every so often (one
+  // request at a time), and show it until the final transcript arrives.
+  private livePartials(on: boolean): void {
+    const every = this.deps.partialsMs ?? 0;
+    const transcriber = this.deps.partialTranscriber;
+    if (!on || every <= 0 || !transcriber) {
+      if (this.partials) clearInterval(this.partials);
+      this.partials = undefined;
+      return;
+    }
+    if (this.partials) return;
+    this.partials = setInterval(() => {
+      const audio = this.deps.listener.speechSoFar;
+      const gen = this.gen;
+      if (!audio || this.partialBusy) return;
+      this.partialBusy = true;
+      transcriber.transcribePcm(Buffer.from(audio.buffer, audio.byteOffset, audio.byteLength))
+        .then((text) => {
+          const words = stripWakePhrase(text);
+          if (words && gen === this.gen && (this.state === "listening" || this.state === "asking")) {
+            this.deps.emit({ type: "partial_transcript", text: words });
+          }
+        }, () => {})
+        .finally(() => (this.partialBusy = false));
+    }, every);
+  }
+
   private setState(state: JarvisState): void {
     if (state !== "listening") this.followUp = false;
     if (state === this.state && state !== "listening") return;
     this.state = state;
     this.deps.listener.watchForSpeech(this.bargeIn && state === "speaking");
+    this.livePartials(state === "listening" || state === "asking");
     this.deps.emit({ type: "state", state, followUp: this.followUp });
     if (state === "thinking" || state === "speaking" || state === "idle") void this.askNext();
   }
@@ -706,8 +921,12 @@ function toolDetail(input: Record<string, unknown>): string {
   return String(detail).split("\n")[0].slice(0, 80);
 }
 
-const SOUNDS = { wake: "/System/Library/Sounds/Pop.aiff", done: "/System/Library/Sounds/Glass.aiff" };
+const SOUNDS = {
+  wake: "/System/Library/Sounds/Pop.aiff",
+  done: "/System/Library/Sounds/Glass.aiff",
+  error: "/System/Library/Sounds/Basso.aiff", // the short low tone of the Error state
+};
 
-function playSound(name: "wake" | "done"): void {
+function playSound(name: Sound): void {
   spawn("afplay", ["-v", "0.4", SOUNDS[name]], { stdio: "ignore" }).on("error", () => {});
 }

@@ -44,7 +44,7 @@ function fakeSession() {
   return { session: session as unknown as ClaudeSession, turns, interrupts: () => interrupted };
 }
 
-function setup(transcripts: string[], opts: { bargeIn?: boolean; history?: HistoryStore } = {}) {
+function setup(transcripts: string[], opts: { bargeIn?: boolean; history?: HistoryStore; partialsMs?: number } = {}) {
   const events: UiEvent[] = [];
   const captures: CaptureOptions[] = [];
   const watching: boolean[] = [];
@@ -80,13 +80,16 @@ function setup(transcripts: string[], opts: { bargeIn?: boolean; history?: Histo
       startCapture: (o: CaptureOptions) => captures.push(o),
       stopCapture() {},
       watchForSpeech: (on: boolean) => watching.push(on),
+      speechSoFar: new Int16Array(16),
     } as unknown as Listener,
     transcriber: { transcribePcm: async () => transcripts.shift() ?? "" } as unknown as Transcriber,
+    partialTranscriber: { transcribePcm: async () => "Hey Jarvis, what's the" },
     speaker: speaker as unknown as Speaker,
     sessions,
     history,
     emit: (e) => events.push(e),
     bargeIn: opts.bargeIn,
+    partialsMs: opts.partialsMs,
   });
   const states = () => events.filter((e) => e.type === "state").map((e) => (e as { state: string }).state);
   return { jarvis, events, captures, spoken, claude, states, watching, history, claudeStarts, projectsDir, sounds };
@@ -497,4 +500,144 @@ test("a note to a finished task asks a follow-up in the same conversation", asyn
   assert.equal(ctx.claude.turns[1].text, "add a test for the empty search");
   assert.equal(lastTask(ctx.events, id).status, "running");
   assert.equal(lastTask(ctx.events, id).reported, false);
+});
+
+test("History window: search lists past conversations, and Continue makes the next wake go there", async () => {
+  const history = new HistoryStore(":memory:");
+  const old = history.createSession("/tmp/jarvis-workspace", "jarvis-workspace", 1000);
+  history.addTurn(old.id, "plan transport to Sepang", "Take the train", [], 1000);
+  history.update(old.id, { title: "Sepang trip", claudeSessionId: "claude-old" });
+  const { jarvis, events, claudeStarts } = setup([], { history });
+  jarvis.prepare();
+
+  jarvis.historyQuery("sepang");
+  const results = events.at(-1) as Extract<UiEvent, { type: "history_results" }>;
+  assert.deepEqual(results.sessions.map((s) => [s.title, s.current]), [["Sepang trip", false]]);
+  assert.deepEqual(results.projects, ["jarvis-workspace"]);
+
+  jarvis.historyOpen(old.id);
+  assert.deepEqual((events.at(-1) as Extract<UiEvent, { type: "history_detail" }>).turns.map((t) => t.reply), ["Take the train"]);
+
+  jarvis.historyContinue(old.id);
+  assert.equal(claudeStarts.at(-1)!.resume, "claude-old");
+  assert.match((events.at(-1) as { text: string }).text, /Sepang trip/);
+  jarvis.historyQuery("");
+  assert.equal((events.at(-1) as Extract<UiEvent, { type: "history_results" }>).sessions[0].current, true);
+});
+
+test("'Always allow' saves a rule for that folder: the next matching request isn't asked", async () => {
+  const ctx = setup([]);
+  ctx.jarvis.prepare(); // session 1 in /tmp/jarvis-workspace
+  const first = ctx.jarvis.requestApproval({ sessionId: 1, toolName: "Bash", input: { command: "npm test" } });
+  await tick();
+  const asked = ctx.events.find((e) => e.type === "approval") as Extract<UiEvent, { type: "approval" }>;
+  assert.equal(asked.always, "Run “npm test” in jarvis-workspace");
+  ctx.jarvis.answerFromUi(asked.id, true, true);
+  assert.equal((await first).behavior, "allow");
+  assert.deepEqual((ctx.events.findLast((e) => e.type === "rules") as Extract<UiEvent, { type: "rules" }>).rules,
+    [{ label: "Run “npm test”", folder: "/tmp/jarvis-workspace" }]);
+
+  const asks = ctx.events.filter((e) => e.type === "approval").length;
+  assert.equal((await ctx.jarvis.requestApproval({ sessionId: 1, toolName: "Bash", input: { command: "npm test -- x" } })).behavior, "allow");
+  assert.equal(ctx.events.filter((e) => e.type === "approval").length, asks, "not asked again");
+
+  const push = ctx.jarvis.requestApproval({ sessionId: 1, toolName: "Bash", input: { command: "git push" } });
+  await tick();
+  assert.equal((ctx.events.at(-1) as Extract<UiEvent, { type: "approval" }>).always, undefined, "never offered for destructive commands");
+  ctx.jarvis.stop();
+  assert.equal((await push).behavior, "deny");
+});
+
+test("a task's report lists the files it changed, with the diff", async () => {
+  const { mkdtempSync: mk, writeFileSync } = await import("node:fs");
+  const ctx = setup([]);
+  const dir = mk(join(tmpdir(), "jarvis-task-"));
+  writeFileSync(join(dir, "a.txt"), "old\n");
+  const id = ctx.jarvis.startTask("Update a.txt");
+  await tick();
+  ctx.claude.turns[0].handlers.onTool!("Edit", { file_path: join(dir, "a.txt"), old_string: "old", new_string: "new" });
+  writeFileSync(join(dir, "a.txt"), "new\n");
+  ctx.claude.turns[0].finish({ text: "Updated it." });
+  await tick();
+  await tick();
+  const report = ctx.events.find((e) => e.type === "task_report" && e.taskId === id) as Extract<UiEvent, { type: "task_report" }>;
+  assert.deepEqual(report.files, [{ path: join(dir, "a.txt"), added: 1, removed: 1 }]);
+  assert.match(report.diff, /-old\n\+new/);
+  ctx.jarvis.activate(true);
+  await tick();
+  assert.match(ctx.spoken.join(" "), /1 file changed\./);
+});
+
+test("can't reach Claude: red Error state, a low tone, and Try again asks the same question", async () => {
+  const ctx = setup(["Jarvis, what did we decide about the history window?"]);
+  ctx.jarvis.activate(true);
+  const first = ctx.jarvis.onUtterance(new Int16Array(16));
+  await tick();
+  ctx.claude.turns[0].finish({ isError: true, text: "Invalid API key · Please run /login" });
+  await first;
+  assert.equal(ctx.jarvis.state, "error");
+  assert.deepEqual(ctx.sounds.slice(-1), ["error"]);
+  const error = ctx.events.find((e) => e.type === "error") as Extract<UiEvent, { type: "error" }>;
+  assert.equal(error.reason, "signed_out");
+  assert.equal(error.command, "claude");
+  assert.match(ctx.spoken.at(-1)!, /signed out/);
+
+  ctx.jarvis.retry();
+  await tick();
+  assert.equal(ctx.claude.turns[1].text, "what did we decide about the history window?");
+  assert.equal(ctx.jarvis.state, "thinking");
+});
+
+test("a usage limit is an ordinary reply; the request waits as a task until the limit resets", async () => {
+  const ctx = setup(["Jarvis, refactor the listener"]);
+  ctx.jarvis.activate(true);
+  const reply = ctx.jarvis.onUtterance(new Int16Array(16));
+  await tick();
+  ctx.claude.turns[0].finish({ isError: true, text: "5-hour limit reached ∙ resets 3pm" });
+  await reply;
+  assert.notEqual(ctx.jarvis.state, "error");
+  assert.match(ctx.spoken.at(-1)!, /usage limit\. It resets at 3 PM, so I'll do this in the background then\./);
+  const task = lastTask(ctx.events);
+  assert.equal(task.status, "queued");
+  assert.equal(task.request, "refactor the listener");
+  assert.match(task.activity, /resets at 3 PM/);
+  assert.equal(ctx.claude.turns.length, 1, "not started before the reset");
+});
+
+test("no speech after the wake word: 'I didn't catch that.' once, then idle", () => {
+  const ctx = setup([]);
+  ctx.jarvis.activate(true);
+  ctx.jarvis.onNoSpeech();
+  assert.deepEqual(ctx.spoken, ["I didn't catch that."]);
+  assert.equal(ctx.jarvis.state, "idle");
+});
+
+test("a failed task is reported with the failing line and that no files changed", async () => {
+  const ctx = setup([]);
+  const id = ctx.jarvis.startTask("Run the e2e tests");
+  await tick();
+  ctx.claude.turns[0].finish({ isError: true, text: "Error: npm test exited with code 1" });
+  await tick();
+  await tick();
+  assert.equal(lastTask(ctx.events, id).status, "failed");
+  const report = ctx.events.find((e) => e.type === "task_report") as Extract<UiEvent, { type: "task_report" }>;
+  assert.equal(report.failed, true);
+  assert.equal(report.error, "Error: npm test exited with code 1");
+  assert.match(report.summary, /ran into a problem: Error: npm test exited with code 1\. No files were changed\./);
+});
+
+test("live words: while listening, the words so far appear; they stop once the request is heard", async () => {
+  const ctx = setup(["what's the weather"], { partialsMs: 5 });
+  ctx.jarvis.activate(true);
+  await new Promise((r) => setTimeout(r, 30));
+  const partial = ctx.events.find((e) => e.type === "partial_transcript") as { text: string };
+  assert.equal(partial.text, "what's the", "wake phrase stripped");
+  const reply = ctx.jarvis.onUtterance(new Int16Array(16));
+  await tick();
+  const count = ctx.events.filter((e) => e.type === "partial_transcript").length;
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(ctx.events.filter((e) => e.type === "partial_transcript").length, count, "none after listening ends");
+  ctx.claude.turns[0].finish({});
+  ctx.jarvis.stop();
+  await reply;
 });

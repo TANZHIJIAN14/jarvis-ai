@@ -7,20 +7,30 @@ import SwiftUI
 
 struct Panel: View {
   @ObservedObject var model: JarvisModel
-  var onApprove: (Int, Bool) -> Void
+  var onApprove: (Int, Bool, Bool) -> Void
   var onReportSeen: (Int) -> Void
   var onOpenAgents: (Int?) -> Void
+  var send: ([String: Any]) -> Void
 
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
-      if model.state == "listening" && !model.followUp && model.thread.last?.reply.isEmpty != false && model.approval == nil {
+      if model.state == "listening" && !model.partial.isEmpty {
+        ListeningLine(words: model.partial)
+      } else if model.state == "listening" && !model.followUp && model.thread.last?.reply.isEmpty != false && model.approval == nil {
         ListeningLine()
       }
       ForEach(Array(model.thread.enumerated()), id: \.element.id) { index, exchange in
         ExchangeView(exchange: exchange, isLatest: index == model.thread.count - 1)
       }
+      if let error = model.error, model.state == "error" {
+        ErrorCard(error: error, onRetry: { send(["type": "retry"]) })
+      }
       ForEach(model.reports) { report in
-        ReportCard(report: report, onDismiss: { onReportSeen(report.id) }, onDetails: { onOpenAgents(report.id) })
+        ReportCard(report: report, onDismiss: { onReportSeen(report.id) }, onDetails: { onOpenAgents(report.id) },
+                   onTryAgain: {
+                     send(["type": "task_note", "taskId": report.id, "text": "That didn't work. Try a different approach."])
+                     onReportSeen(report.id)
+                   })
       }
       if let approval = model.approval {
         ApprovalCard(approval: approval, onApprove: onApprove)
@@ -48,11 +58,17 @@ struct Panel: View {
   }
 }
 
+// "Listening…", then your words as they're recognised.
 private struct ListeningLine: View {
+  var words = ""
+
   var body: some View {
     HStack(alignment: .firstTextBaseline, spacing: 8) {
       Image(systemName: "mic").foregroundStyle(Theme.running)
-      Text("Listening…").font(.system(size: 17)).foregroundStyle(Theme.secondary)
+      Text(words.isEmpty ? "Listening…" : "\(words)…")
+        .font(.system(size: 17))
+        .foregroundStyle(words.isEmpty ? Theme.secondary : Theme.text)
+        .animation(.easeOut(duration: 0.15), value: words)
     }
   }
 }
@@ -122,7 +138,7 @@ private struct ReplyText: View {
 
 private struct ApprovalCard: View {
   let approval: Approval
-  var onApprove: (Int, Bool) -> Void
+  var onApprove: (Int, Bool, Bool) -> Void
 
   var body: some View {
     VStack(alignment: .leading, spacing: 10) {
@@ -139,12 +155,18 @@ private struct ApprovalCard: View {
             .background(Theme.text.opacity(0.05), in: RoundedRectangle(cornerRadius: 7))
         }
         HStack(spacing: 8) {
-          Button("Allow") { onApprove(approval.id, true) }.buttonStyle(PrimaryButton())
-          Button("Deny") { onApprove(approval.id, false) }.buttonStyle(SecondaryButton())
+          Button("Allow") { onApprove(approval.id, true, false) }.buttonStyle(PrimaryButton())
+          Button("Deny") { onApprove(approval.id, false, false) }.buttonStyle(SecondaryButton())
           Spacer()
           Text(approval.destructive ? "Can't be undone: needs a click" : "or just say yes or no")
             .font(.system(size: 12))
             .foregroundStyle(approval.destructive ? Theme.needsYouText : Theme.secondary)
+        }
+        if let always = approval.always {
+          Button("Always allow: \(always)") { onApprove(approval.id, true, true) }
+            .buttonStyle(.link)
+            .font(.system(size: 12))
+            .lineLimit(1)
         }
       }
       .padding(12)
@@ -154,15 +176,53 @@ private struct ApprovalCard: View {
   }
 }
 
+// "I can't reach Claude right now…": the command to run, Try again (asks the kept question) and Open Terminal.
+private struct ErrorCard: View {
+  let error: ClaudeError
+  var onRetry: () -> Void
+  @State private var copied = false
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      Text(error.text).font(.system(size: 15))
+      VStack(alignment: .leading, spacing: 8) {
+        HStack(spacing: 10) {
+          Text(error.command).font(.system(size: 13, design: .monospaced)).textSelection(.enabled)
+          Spacer()
+          Button(copied ? "Copied" : "Copy") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(error.command, forType: .string)
+            copied = true
+          }
+          .buttonStyle(SecondaryButton())
+        }
+        HStack(spacing: 8) {
+          Button("Try again", action: onRetry).buttonStyle(PrimaryButton())
+          Button("Open Terminal") {
+            if let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") {
+              NSWorkspace.shared.openApplication(at: terminal, configuration: NSWorkspace.OpenConfiguration())
+            }
+          }
+          .buttonStyle(SecondaryButton())
+        }
+      }
+      .padding(12)
+      .background(Theme.failed.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+      .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.failed.opacity(0.25), lineWidth: 1))
+    }
+  }
+}
+
 private struct ReportCard: View {
   let report: Report
   var onDismiss: () -> Void
   var onDetails: () -> Void
+  var onTryAgain: () -> Void
 
   var body: some View {
     VStack(alignment: .leading, spacing: 6) {
       HStack(spacing: 8) {
-        Circle().strokeBorder(Theme.done, lineWidth: 1.5).frame(width: 8, height: 8)
+        Circle().strokeBorder(report.failed ? Theme.failed : Theme.done, lineWidth: 1.5).frame(width: 8, height: 8)
         Text(report.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
         Spacer()
         Button("Details", action: onDetails).buttonStyle(.link).font(.system(size: 12))
@@ -172,6 +232,12 @@ private struct ReportCard: View {
         .font(.system(size: 13))
         .lineLimit(6)
         .textSelection(.enabled)
+      if !report.files.isEmpty {
+        FilesChanged(files: report.files, limit: 3)
+      }
+      if report.failed {
+        Button("Try a different approach", action: onTryAgain).buttonStyle(SecondaryButton()).padding(.top, 4)
+      }
     }
     .padding(12)
     .background(Theme.card, in: RoundedRectangle(cornerRadius: 10))
@@ -230,6 +296,72 @@ private struct Footer: View {
     .foregroundStyle(Theme.secondary)
     .padding(.top, 10)
     .overlay(alignment: .top) { Rectangle().fill(Theme.panelBorder).frame(height: 1) }
+  }
+}
+
+// "2 files changed": each file with its +added −removed, in SF Mono.
+struct FilesChanged: View {
+  let files: [FileChange]
+  var limit = Int.max
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 3) {
+      Text(files.count == 1 ? "1 file changed" : "\(files.count) files changed")
+        .font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.secondary)
+      ForEach(files.prefix(limit)) { file in
+        HStack(spacing: 8) {
+          Text(file.path).font(.system(size: 12, design: .monospaced)).lineLimit(1).truncationMode(.head)
+          Spacer(minLength: 4)
+          Text("+\(file.added)").font(.system(size: 12, design: .monospaced)).foregroundStyle(Theme.done)
+          Text("−\(file.removed)").font(.system(size: 12, design: .monospaced)).foregroundStyle(Theme.failed)
+        }
+      }
+      if files.count > limit {
+        Text("and \(files.count - limit) more").font(.system(size: 12)).foregroundStyle(Theme.secondary)
+      }
+    }
+  }
+}
+
+// A unified diff with added lines in green and removed lines in red.
+struct DiffView: View {
+  let diff: String
+  @State private var width: CGFloat = 0
+
+  var body: some View {
+    let lines = diff.components(separatedBy: "\n")
+    ScrollView(.horizontal, showsIndicators: false) {
+      // At least as wide as the box, so added and removed rows are tinted edge to edge.
+      VStack(alignment: .leading, spacing: 0) {
+        ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+          Text(line.isEmpty ? " " : line)
+            .font(.system(size: 12, design: .monospaced))
+            .foregroundStyle(color(line))
+            .padding(.horizontal, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(background(line))
+        }
+      }
+      .padding(.vertical, 8)
+      .frame(minWidth: width, alignment: .leading)
+    }
+    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
+    .textSelection(.enabled)
+    .background(Theme.text.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+  }
+
+  private func color(_ line: String) -> Color {
+    if line.hasPrefix("+++") || line.hasPrefix("---") { return Theme.text }
+    if line.hasPrefix("+") { return Theme.done }
+    if line.hasPrefix("-") { return Theme.failed }
+    if line.hasPrefix("@@") { return Theme.running }
+    return Theme.secondary
+  }
+
+  private func background(_ line: String) -> Color {
+    if line.hasPrefix("+") && !line.hasPrefix("+++") { return Theme.done.opacity(0.08) }
+    if line.hasPrefix("-") && !line.hasPrefix("---") { return Theme.failed.opacity(0.08) }
+    return .clear
   }
 }
 

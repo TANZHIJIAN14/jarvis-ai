@@ -105,6 +105,37 @@ export class HistoryStore {
     return this.db.prepare("SELECT * FROM turns WHERE session_id = ? ORDER BY at").all(sessionId).map(toTurn);
   }
 
+  // The History window's list: sessions containing every typed word (in the title, summary,
+  // project or anything said), most recently active first. Empty query = all of them.
+  search(query: string, opts: { project?: string; limit?: number } = {}): SessionRecord[] {
+    const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+    const said = new Map<number, string>();
+    if (words.length > 0) {
+      const rows = this.db.prepare("SELECT session_id, user_text, reply_text FROM turns").all();
+      for (const row of rows) {
+        const id = Number(row.session_id);
+        said.set(id, `${said.get(id) ?? ""} ${String(row.user_text)} ${String(row.reply_text)}`);
+      }
+    }
+    return this.db
+      .prepare("SELECT * FROM sessions WHERE turns > 0 AND (? IS NULL OR project = ?) ORDER BY last_active_at DESC")
+      .all(opts.project ?? null, opts.project ?? null)
+      .map(toSession)
+      .filter((s) => {
+        const text = `${s.title ?? ""} ${s.summary ?? ""} ${s.project} ${said.get(s.id) ?? ""}`.toLowerCase();
+        return words.every((w) => text.includes(w));
+      })
+      .slice(0, opts.limit ?? 200);
+  }
+
+  // Projects with conversations, most recently active first.
+  projects(): string[] {
+    return this.db
+      .prepare("SELECT project, MAX(last_active_at) AS last FROM sessions WHERE turns > 0 GROUP BY project ORDER BY last DESC")
+      .all()
+      .map((row) => String(row.project));
+  }
+
   // Sessions best matching a spoken description ("the auth refactor", "the kokoro voice").
   // `coverage` is the share of the description's keywords found anywhere in the session.
   findSessions(query: string, limit = 3): Array<{ session: SessionRecord; score: number; coverage: number }> {
@@ -145,6 +176,11 @@ export class HistoryStore {
       }))
       .sort((a, b) => b.score - a.score || b.turn.at - a.turn.at)
       .slice(0, limit);
+  }
+
+  // Settings → Privacy → Clear history.
+  clear(): void {
+    this.db.exec("DELETE FROM turns; DELETE FROM sessions;");
   }
 
   close(): void {

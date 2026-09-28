@@ -28,6 +28,7 @@ export type CaptureOptions = {
   preRollMs: number; // audio from before capture started, e.g. the "Hey Jarvis" itself
   noSpeechTimeoutMs: number; // give up if nobody starts talking
   speechStarted?: boolean; // the pre-roll already holds speech (barge-in): only wait for the end
+  held?: boolean; // push to talk: ends at finishCapture() (key released), not on silence
 };
 
 export type ListenerOptions = {
@@ -98,6 +99,11 @@ export class Listener {
     return this.capture !== undefined;
   }
 
+  // What's been said so far in this capture, once speech has started (for live words).
+  get speechSoFar(): Int16Array | undefined {
+    return this.capture?.started ? concatAll(this.capture.audio) : undefined;
+  }
+
   // Model calls are async; chunks are processed strictly in order.
   feed(samples: Int16Array): Promise<void> {
     this.queue = this.queue.then(() => this.process(samples));
@@ -121,6 +127,23 @@ export class Listener {
 
   stopCapture(): void {
     this.capture = undefined;
+  }
+
+  // Push to talk released: what was said so far is the utterance (after audio already fed).
+  finishCapture(): void {
+    this.queue = this.queue.then(() => {
+      const c = this.capture;
+      if (!c) return;
+      this.capture = undefined;
+      this.wake.reset();
+      if (c.speechMs >= this.opts.minSpeechMs) this.handlers.onUtterance?.(concatAll(c.audio));
+      else this.handlers.onNoSpeech?.();
+    });
+  }
+
+  // Settings: wake word sensitivity.
+  setWakeThreshold(value: number): void {
+    this.opts.wakeThreshold = value;
   }
 
   // While Jarvis is speaking: report sustained speech (with echo cancellation on, that's the
@@ -204,6 +227,7 @@ export class Listener {
         c.silenceMs += VAD_FRAME_MS;
       }
 
+      if (c.held && c.elapsedMs < this.opts.maxUtteranceMs) continue; // ends when the key is released
       if (c.started && (c.silenceMs >= this.opts.endSilenceMs || c.elapsedMs >= this.opts.maxUtteranceMs)) {
         this.capture = undefined;
         this.wake.reset();

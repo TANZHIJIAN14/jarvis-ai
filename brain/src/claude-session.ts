@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
+import { CRASHED, NOT_INSTALLED } from "./errors.ts";
 
 // One long-lived Claude Code conversation, driven through the user's own `claude`
 // CLI (their subscription login) in headless stream-json mode.
@@ -99,12 +100,20 @@ export class ClaudeSession {
     createInterface({ input: proc.stdout! }).on("line", (line) => {
       if (this.proc === proc) this.onLine(line);
     });
+    proc.stdin!.on("error", () => {}); // a dead process: reported through "exit" or "error"
+    proc.on("error", (err: NodeJS.ErrnoException) => {
+      if (this.proc !== proc) return;
+      this.proc = undefined;
+      this.finishTurn({ text: err.code === "ENOENT" ? NOT_INSTALLED : CRASHED, isError: true, interrupted: false });
+    });
     proc.on("exit", () => {
       if (this.proc !== proc) return; // already retired
       this.proc = undefined;
       const expected = this.closing || this.interrupting;
       this.interrupting = false;
-      this.finishTurn({ text: "", isError: !expected, interrupted: true });
+      this.finishTurn(expected
+        ? { text: "", isError: false, interrupted: true }
+        : { text: CRASHED, isError: true, interrupted: false });
     });
   }
 

@@ -27,6 +27,7 @@ export type SessionManagerDeps = {
   ask?: Ask; // titles and summaries; skipped when absent
   defaultCwd: string;
   projectsDir: string;
+  extraProjects?: () => string[]; // folders added in Settings
   onChange?: (session: SessionRecord) => void;
   now?: () => number;
   idleMs?: number;
@@ -34,9 +35,11 @@ export type SessionManagerDeps = {
 
 export class SessionManager {
   private deps: SessionManagerDeps;
-  private current: { record: SessionRecord; claude: ClaudeSession } | undefined;
+  // `since`: when this session became current. A resumed old session counts as active from then.
+  private current: { record: SessionRecord; claude: ClaudeSession; since: number } | undefined;
   private backgrounded = new Map<number, { record: SessionRecord; claude: ClaudeSession }>();
   private pending: Promise<unknown>[] = []; // titles and summaries in flight
+  maxBackground = MAX_BACKGROUND; // Settings: tasks at once
 
   constructor(deps: SessionManagerDeps) {
     this.deps = deps;
@@ -57,7 +60,8 @@ export class SessionManager {
   // The session for the next request, applying the 10-minute rule.
   forTurn(): ClaudeSession {
     const record = this.record;
-    const idle = record && record.turns > 0 && this.now() - record.lastActiveAt > (this.deps.idleMs ?? IDLE_MS);
+    const lastActive = record && Math.max(record.lastActiveAt, this.current!.since);
+    const idle = record && record.turns > 0 && this.now() - lastActive! > (this.deps.idleMs ?? IDLE_MS);
     if (!this.current || idle) this.startNew(this.current?.record.cwd ?? this.deps.defaultCwd);
     return this.current!.claude;
   }
@@ -70,7 +74,7 @@ export class SessionManager {
   startNew(cwd = this.deps.defaultCwd): SessionRecord {
     this.finishCurrent();
     const record = this.deps.history.createSession(cwd, basename(cwd), this.now());
-    this.current = { record, claude: this.deps.newClaude({ cwd, sessionId: record.id }) };
+    this.current = { record, claude: this.deps.newClaude({ cwd, sessionId: record.id }), since: this.now() };
     this.current.claude.warm();
     this.deps.onChange?.(record);
     return record;
@@ -79,7 +83,7 @@ export class SessionManager {
   resume(record: SessionRecord): void {
     this.finishCurrent();
     const claude = this.deps.newClaude({ cwd: record.cwd, resume: record.claudeSessionId ?? undefined, sessionId: record.id });
-    this.current = { record, claude };
+    this.current = { record, claude, since: this.now() };
     claude.warm();
     this.deps.onChange?.(record);
   }
@@ -88,7 +92,7 @@ export class SessionManager {
   // Undefined when there's nothing running or no room for another background task.
   detach(): SessionRecord | undefined {
     const current = this.current;
-    if (!current?.claude.busy || this.backgrounded.size >= MAX_BACKGROUND) return undefined;
+    if (!current?.claude.busy || this.backgrounded.size >= this.maxBackground) return undefined;
     this.backgrounded.set(current.record.id, current);
     this.current = undefined;
     return current.record;
@@ -106,7 +110,7 @@ export class SessionManager {
   }
 
   canStartBackground(): boolean {
-    return this.backgrounded.size < MAX_BACKGROUND;
+    return this.backgrounded.size < this.maxBackground;
   }
 
   backgroundClaude(id: number): ClaudeSession | undefined {
@@ -145,8 +149,12 @@ export class SessionManager {
     const wanted = normalize(spoken);
     if (!wanted) return undefined;
     let best: { path: string; score: number } | undefined;
-    for (const name of readdirSync(this.deps.projectsDir)) {
-      const path = join(this.deps.projectsDir, name);
+    const folders = [
+      ...(this.deps.extraProjects?.() ?? []),
+      ...readdirSync(this.deps.projectsDir).map((name) => join(this.deps.projectsDir, name)),
+    ];
+    for (const path of folders) {
+      const name = basename(path);
       if (name.startsWith(".") || !isDirectory(path)) continue;
       const have = normalize(name);
       const score = have === wanted ? 3 : have.startsWith(wanted) || wanted.startsWith(have) ? 2 : have.includes(wanted) ? 1 : 0;
@@ -210,7 +218,8 @@ export class SessionManager {
     this.track(
       ask(
         "Summarize the conversation on stdin in 2 or 3 plain sentences for someone looking back at it later: " +
-          "what it was about, what was decided, and anything left open. Reply with only the summary.",
+          "what it was about and what was decided. Then, for each thing left open or unconfirmed, add a line " +
+          "starting with \"Open: \" (none if nothing is open). Reply with only the summary.",
         text,
       ).then((summary) => this.deps.history.update(record.id, { summary })),
     );

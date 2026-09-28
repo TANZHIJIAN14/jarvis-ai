@@ -10,7 +10,7 @@ import { toWav } from "./recorder.ts";
 // tensor prep) and blocked the main event loop for seconds per reply, starving the mic stream:
 // the wake word and talk-over detection heard nothing while Jarvis spoke.
 //
-// in:  { id, text }      out: { ready } | { id, file } | { id, error } | { loadError }
+// in:  { id, text, voice?, speed? }      out: { ready } | { id, file } | { id, error } | { loadError }
 
 const MODEL = "onnx-community/Kokoro-82M-v1.0-ONNX";
 const { voice, speed, cacheDir } = workerData as { voice: string; speed: number; cacheDir: string };
@@ -18,8 +18,9 @@ const dir = join(tmpdir(), "jarvis-tts");
 mkdirSync(dir, { recursive: true });
 let count = 0;
 
-async function synthesize(tts: KokoroTTS, text: string): Promise<string> {
-  const audio = await tts.generate(text, { voice: voice as never, speed });
+async function synthesize(tts: KokoroTTS, text: string, as = voice, rate = speed): Promise<string> {
+  if (!(as in tts.voices)) throw new Error(`Unknown Kokoro voice "${as}"`);
+  const audio = await tts.generate(text, { voice: as as never, speed: rate });
   const pcm = Buffer.alloc(audio.audio.length * 2);
   audio.audio.forEach((sample, i) => pcm.writeInt16LE(Math.round(Math.max(-1, Math.min(1, sample)) * 32767), i * 2));
   const file = join(dir, `${process.pid}-${count++}.wav`);
@@ -29,7 +30,15 @@ async function synthesize(tts: KokoroTTS, text: string): Promise<string> {
 
 try {
   env.cacheDir = cacheDir;
-  const tts = await KokoroTTS.from_pretrained(MODEL, { dtype: "fp32", device: "cpu" });
+  // Download progress (first run only), for the first-run setup window.
+  const files = new Map<string, { loaded: number; total: number }>();
+  const progress_callback = (p: { status: string; file?: string; loaded?: number; total?: number }) => {
+    if (p.status !== "progress" || !p.file || !p.total) return;
+    files.set(p.file, { loaded: p.loaded ?? 0, total: p.total });
+    const all = [...files.values()];
+    parentPort!.postMessage({ progress: { loaded: all.reduce((n, f) => n + f.loaded, 0), total: all.reduce((n, f) => n + f.total, 0) } });
+  };
+  const tts = await KokoroTTS.from_pretrained(MODEL, { dtype: "fp32", device: "cpu", progress_callback: progress_callback as never });
   if (!(voice in tts.voices)) {
     throw new Error(`Unknown Kokoro voice "${voice}". Try one of: ${Object.keys(tts.voices).join(", ")}`);
   }
@@ -38,10 +47,10 @@ try {
 
   // One sentence at a time, in order.
   let queue = Promise.resolve();
-  parentPort!.on("message", ({ id, text }: { id: number; text: string }) => {
+  parentPort!.on("message", ({ id, text, voice: as, speed: rate }: { id: number; text: string; voice?: string; speed?: number }) => {
     queue = queue.then(async () => {
       try {
-        parentPort!.postMessage({ id, file: await synthesize(tts, text) });
+        parentPort!.postMessage({ id, file: await synthesize(tts, text, as, rate) });
       } catch (err) {
         parentPort!.postMessage({ id, error: (err as Error).message });
       }
